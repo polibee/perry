@@ -3319,35 +3319,54 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 auto_captures.len()
             };
 
-            let blk = ctx.block();
             let func_ref = format!("@{}", func_name);
             let cap_count = total_caps.to_string();
-            let closure_handle = blk.call(
-                I64,
-                "js_closure_alloc",
-                &[(PTR, &func_ref), (I32, &cap_count)],
-            );
-            for (idx, val) in captured_values.iter().enumerate() {
-                let idx_str = idx.to_string();
-                blk.call_void(
-                    "js_closure_set_capture_f64",
-                    &[(I64, &closure_handle), (I32, &idx_str), (DOUBLE, val)],
-                );
+            let closure_handle = {
+                let blk = ctx.block();
+                blk.call(
+                    I64,
+                    "js_closure_alloc",
+                    &[(PTR, &func_ref), (I32, &cap_count)],
+                )
+            };
+            {
+                let blk = ctx.block();
+                for (idx, val) in captured_values.iter().enumerate() {
+                    let idx_str = idx.to_string();
+                    blk.call_void(
+                        "js_closure_set_capture_f64",
+                        &[(I64, &closure_handle), (I32, &idx_str), (DOUBLE, val)],
+                    );
+                }
             }
-            // Initialize the reserved `this` slot to 0.0 so reads
-            // don't return garbage before any patch happens.
+            // Issue #291: when the closure is built inside a method
+            // body (or constructor), the enclosing frame's `this` is the
+            // topmost entry on `this_stack`; load and write that into
+            // the reserved capture slot. Without this, the closure's
+            // `Expr::This` reads back 0.0 and any `this.field` access in
+            // the body crashes. Module-level / function-level call sites
+            // have an empty `this_stack` — keep the 0.0 sentinel there
+            // (matches the previous behavior for top-level arrow expressions
+            // that legitimately have no `this` binding).
             if *captures_this {
                 let this_idx = auto_captures.len().to_string();
+                let this_slot = ctx.this_stack.last().cloned();
+                let this_value = if let Some(slot) = this_slot {
+                    ctx.block().load(DOUBLE, &slot)
+                } else {
+                    double_literal(0.0)
+                };
+                let blk = ctx.block();
                 blk.call_void(
                     "js_closure_set_capture_f64",
                     &[
                         (I64, &closure_handle),
                         (I32, &this_idx),
-                        (DOUBLE, &double_literal(0.0)),
+                        (DOUBLE, &this_value),
                     ],
                 );
             }
-            Ok(nanbox_pointer_inline(blk, &closure_handle))
+            Ok(nanbox_pointer_inline(ctx.block(), &closure_handle))
         }
 
         // -------- Classes (Phase C.1) --------

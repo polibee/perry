@@ -1524,6 +1524,28 @@ fn substitute_this(expr: &mut Expr, obj_id: LocalId) {
         Expr::Await(inner) => {
             substitute_this(inner, obj_id);
         }
+        // Issue #291: when inlining a method body, nested closures that
+        // captured `this` from the outer method's frame need their own
+        // `Expr::This` → `LocalGet(obj_id)` rewrite — after inlining the
+        // closure is hoisted into the call site's frame (module init for
+        // top-level calls, where `this_stack` is empty), so the codegen-
+        // side fallback can't recover a meaningful `this`. Substituting
+        // here lets the closure run with the correct receiver.
+        //
+        // Also: explicitly add `obj_id` to the closure's captures list
+        // and clear `captures_this` — the body now reads `LocalGet(obj_id)`
+        // rather than `Expr::This`, and `compute_auto_captures` blends
+        // explicit + body-scanned ids before excluding module globals,
+        // so adding to `captures` ensures the receiver is forwarded
+        // through the closure's capture array regardless of where the
+        // call site lands.
+        Expr::Closure { body, captures, captures_this, .. } => {
+            substitute_this_in_stmts(body, obj_id);
+            *captures_this = false;
+            if !captures.contains(&obj_id) {
+                captures.push(obj_id);
+            }
+        }
         _ => {}
     }
 }

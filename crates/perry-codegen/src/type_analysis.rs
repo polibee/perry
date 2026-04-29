@@ -1191,6 +1191,35 @@ pub(crate) fn static_type_of(ctx: &FnCtx<'_>, e: &Expr) -> Option<HirType> {
             }
             _ => None,
         },
+        // `a || b` and `a ?? b` lower to `Expr::Logical`. Recognize the
+        // result as Array-typed when EITHER branch is Array — `is_array_expr`
+        // already accepts the Union form, so this lets `(maybeArr || []).slice()`
+        // route through the array fast path instead of falling through to
+        // `js_native_call_method`, which has no `slice` arm for arrays and
+        // returns a sentinel that downstream `.sort(cmp)` deref's to null
+        // (issue #291). `&&` likewise — its truthy result is the right
+        // operand which is an array literal in the common idiom.
+        Expr::Logical { left, right, .. } => {
+            let lt = static_type_of(ctx, left);
+            let rt = static_type_of(ctx, right);
+            match (lt, rt) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), Some(b)) => Some(HirType::Union(vec![a, b])),
+                (Some(t), None) | (None, Some(t)) => Some(t),
+                _ => None,
+            }
+        }
+        // `cond ? a : b` — same logic as Logical.
+        Expr::Conditional { then_expr, else_expr, .. } => {
+            let lt = static_type_of(ctx, then_expr);
+            let rt = static_type_of(ctx, else_expr);
+            match (lt, rt) {
+                (Some(a), Some(b)) if a == b => Some(a),
+                (Some(a), Some(b)) => Some(HirType::Union(vec![a, b])),
+                (Some(t), None) | (None, Some(t)) => Some(t),
+                _ => None,
+            }
+        }
         _ => None,
     }
 }
