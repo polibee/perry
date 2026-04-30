@@ -155,7 +155,3 @@ private-*
 # mdBook output
 docs/book/
 
-# Showcase example npm lockfiles — regenerated on `npm install`. Tracking
-# them just feeds Dependabot stale CVEs in transitive deps of demo apps
-# nobody deploys.
-example-code/*/package-lock.json

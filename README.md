@@ -307,23 +307,21 @@ The output is a standalone binary — no `node_modules` needed at runtime.
 
 ## Example Projects
 
-The `example-code/` directory contains ready-to-run projects showing Perry in real-world scenarios:
+Ready-to-run demos live in their own repo: **[PerryTS/perry-examples](https://github.com/PerryTS/perry-examples)**.
 
 | Example | Stack | What it demonstrates |
 |---------|-------|---------------------|
-| **[express-postgres](example-code/express-postgres/)** | Express + PostgreSQL | Multi-file routes, middleware (CORS, Helmet), connection pooling, error handling |
-| **[fastify-redis-mysql](example-code/fastify-redis-mysql/)** | Fastify + Redis + MySQL | Rate limiting, caching layer, database queries, dotenv config |
-| **[hono-mongodb](example-code/hono-mongodb/)** | Hono + MongoDB | Lightweight HTTP framework with document database |
-| **[nestjs-typeorm](example-code/nestjs-typeorm/)** | NestJS + TypeORM | Decorator-based architecture, dependency injection |
-| **[nextjs-prisma](example-code/nextjs-prisma/)** | Next.js-style + Prisma | ORM integration, database migrations |
-| **[koa-redis](example-code/koa-redis/)** | Koa + Redis | Middleware composition, session storage |
-| **[http-server](example-code/http-server/)** | Raw HTTP | Low-level request handling, routing, JSON APIs |
-| **[blockchain-demo](example-code/blockchain-demo/)** | Custom | Blockchain implementation in pure TypeScript |
-
-Each example has its own `package.json` and can be compiled with:
+| **[express-postgres](https://github.com/PerryTS/perry-examples/tree/main/express-postgres)** | Express + PostgreSQL | Multi-file routes, middleware (CORS, Helmet), connection pooling, error handling |
+| **[fastify-redis-mysql](https://github.com/PerryTS/perry-examples/tree/main/fastify-redis-mysql)** | Fastify + Redis + MySQL | Rate limiting, caching layer, database queries, dotenv config |
+| **[hono-mongodb](https://github.com/PerryTS/perry-examples/tree/main/hono-mongodb)** | Hono + MongoDB | Lightweight HTTP framework with document database |
+| **[nestjs-typeorm](https://github.com/PerryTS/perry-examples/tree/main/nestjs-typeorm)** | NestJS + TypeORM | Decorator-based architecture, dependency injection |
+| **[nextjs-prisma](https://github.com/PerryTS/perry-examples/tree/main/nextjs-prisma)** | Next.js-style + Prisma | ORM integration, database migrations |
+| **[koa-redis](https://github.com/PerryTS/perry-examples/tree/main/koa-redis)** | Koa + Redis | Middleware composition, session storage |
+| **[blockchain-demo](https://github.com/PerryTS/perry-examples/tree/main/blockchain-demo)** | Custom | Blockchain implementation in pure TypeScript |
 
 ```bash
-cd example-code/fastify-redis-mysql
+git clone https://github.com/PerryTS/perry-examples
+cd perry-examples/fastify-redis-mysql
 npm install
 perry compile src/index.ts -o server && ./server
 ```
@@ -718,7 +716,6 @@ perry/
 │   ├── perry-jsruntime/        # Optional V8 interop via QuickJS
 │   └── perry-diagnostics/      # Error reporting
 ├── docs/                       # Documentation site (mdBook)
-├── example-code/               # 8 example applications
 ├── benchmarks/                 # Benchmark suite (Perry vs Node.js vs Bun)
 ├── packages/                   # npm packages (@perryts/threads)
 └── test-files/                 # Test suite
