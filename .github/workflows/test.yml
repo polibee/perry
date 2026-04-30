@@ -55,18 +55,18 @@ jobs:
   # required the manual simulator-runtime wipe + cache=registry-only
   # workaround). Each downstream job below builds in parallel directly.
   cargo-test:
-    runs-on: macos-14
+    # Was macos-14 — moved to ubuntu-latest in v0.5.392 to drop the 10×
+    # billing weight. cargo-test's `--exclude` list already filters out
+    # every macOS-specific UI crate (perry-ui-{ios,visionos,tvos,
+    # watchos,gtk4,android,windows} per the comment block below), so
+    # the platform-independent test set runs identically on Linux. The
+    # macOS-host coverage we lose here is negligible — these tests
+    # don't exercise any platform behavior; they're pure logic +
+    # codegen.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # macos-14 ships with ~14 GB free disk after the preinstalled Xcode +
-      # iOS/tvOS/watchOS simulator runtime images. Several `cargo build
-      # --release` jobs in this workflow consistently OOM'd at the cache
-      # restore step (`No space left on device` from the runner's own
-      # diagnostic writer, before cargo even started). Wiping the simulator
-      # runtime IMAGES — not the SDKs — reclaims ~15-25 GB without
-      # affecting cross-compile to `aarch64-apple-ios-sim` (that only needs
-      # the SDK, which lives inside the active Xcode app).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -98,18 +98,16 @@ jobs:
   # Parity tests (Perry output vs Node.js)
   # ---------------------------------------------------------------------------
   parity:
-    runs-on: macos-14
+    # Was macos-14 — moved to ubuntu-latest in v0.5.392. Parity tests
+    # just compare Perry's stdout against `node --experimental-strip-types`'s
+    # stdout per test file; both run cleanly on Linux. `gtimeout` on
+    # macOS is `timeout` on Linux (the run_parity_tests.sh wrapper
+    # detects either). Node 22+ is installed via setup-node@v4 below.
+    # 10× billing weight cut.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # macos-14 ships with ~14 GB free disk after the preinstalled Xcode +
-      # iOS/tvOS/watchOS simulator runtime images. Several `cargo build
-      # --release` jobs in this workflow consistently OOM'd at the cache
-      # restore step (`No space left on device` from the runner's own
-      # diagnostic writer, before cargo even started). Wiping the simulator
-      # runtime IMAGES — not the SDKs — reclaims ~15-25 GB without
-      # affecting cross-compile to `aarch64-apple-ios-sim` (that only needs
-      # the SDK, which lives inside the active Xcode app).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -198,18 +196,20 @@ jobs:
   # Compile smoke test (all 130+ test files must compile)
   # ---------------------------------------------------------------------------
   compile-smoke:
-    runs-on: macos-14
+    # Was macos-14 — moved to ubuntu-latest in v0.5.392. The smoke
+    # compiles every `test-files/*.ts` with the bare `perry foo.ts -o
+    # out` path; the auto-optimize cache + clang link steps work
+    # identically on Linux. The v0.5.385 sha256 sidecar is portable
+    # via `command -v sha256sum || shasum -a 256`. `xargs -P` is
+    # GNU on Linux (the macos-14 BSD xargs we tuned for behaves the
+    # same for our usage). Linux runners are 4-vCPU vs macos-14's 3,
+    # so could try NJOBS=4, but keeping NJOBS=3 + retry conservatively
+    # for the cargo auto-optimize race (issue tracked separately).
+    # 10× billing weight cut.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      # macos-14 ships with ~14 GB free disk after the preinstalled Xcode +
-      # iOS/tvOS/watchOS simulator runtime images. Several `cargo build
-      # --release` jobs in this workflow consistently OOM'd at the cache
-      # restore step (`No space left on device` from the runner's own
-      # diagnostic writer, before cargo even started). Wiping the simulator
-      # runtime IMAGES — not the SDKs — reclaims ~15-25 GB without
-      # affecting cross-compile to `aarch64-apple-ios-sim` (that only needs
-      # the SDK, which lives inside the active Xcode app).
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
