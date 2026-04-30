@@ -208,7 +208,7 @@ pub(super) fn lower_builtin_new(
         }
         "Array" => {
             // `new Array()` → empty array, `new Array(n)` → length-n array
-            // (zero-initialized slots), `new Array(a, b, c)` → 3-element array
+            // (slots NaN-boxed `undefined`, see issue #323), `new Array(a, b, c)` → 3-element array
             // [a, b, c]. We handle the no-arg and single-numeric-arg cases
             // here. Multi-arg / non-numeric single arg falls back to the
             // generic Expr::New path.

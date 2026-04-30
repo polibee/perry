@@ -1935,7 +1935,16 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                         let with_header = fast_blk.add(I64, &byte_offset, "8");
                         let element_addr = fast_blk.add(I64, &arr_handle, &with_header);
                         let element_ptr = fast_blk.inttoptr(I64, &element_addr);
-                        let fast_val = fast_blk.load(DOUBLE, &element_ptr);
+                        let fast_raw = fast_blk.load(DOUBLE, &element_ptr);
+                        // Issue #323: `new Array(n)` slots are pre-filled with
+                        // TAG_HOLE so `Object.keys` / `in` can distinguish a
+                        // never-written slot from `arr[i] = undefined`. Reads
+                        // must translate HOLE → UNDEFINED so user code never
+                        // sees the sentinel. Branchless select.
+                        let fast_raw_bits = fast_blk.bitcast_double_to_i64(&fast_raw);
+                        let is_hole = fast_blk.icmp_eq(I64, &fast_raw_bits, crate::nanbox::TAG_HOLE_I64);
+                        let undef_d = fast_blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
+                        let fast_val = fast_blk.select(crate::types::I1, &is_hole, DOUBLE, &undef_d, &fast_raw);
                         let fast_end_label = fast_blk.label.clone();
                         fast_blk.br(&merge_label);
 
@@ -2026,7 +2035,13 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
                 let with_header = blk.add(I64, &byte_offset, "8");
                 let element_addr = blk.add(I64, &arr_handle, &with_header);
                 let element_ptr = blk.inttoptr(I64, &element_addr);
-                let val = blk.load(DOUBLE, &element_ptr);
+                let raw = blk.load(DOUBLE, &element_ptr);
+                // Issue #323: HOLE → UNDEFINED translation (see bounded-index
+                // path above). Branchless select keeps the hot path tight.
+                let raw_bits = blk.bitcast_double_to_i64(&raw);
+                let is_hole = blk.icmp_eq(I64, &raw_bits, crate::nanbox::TAG_HOLE_I64);
+                let undef_d = blk.bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
+                let val = blk.select(crate::types::I1, &is_hole, DOUBLE, &undef_d, &raw);
                 let ok_end_label = ctx.block().label.clone();
                 ctx.block().br(&merge_label);
                 ctx.current_block = oob_idx;
@@ -2188,7 +2203,23 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             let with_hdr = ctx.block().add(I64, &byte_off, "8");
             let elem_addr = ctx.block().add(I64, &obj_handle, &with_hdr);
             let elem_ptr = ctx.block().inttoptr(I64, &elem_addr);
-            let v_num_fast = ctx.block().load(DOUBLE, &elem_ptr);
+            let v_num_raw = ctx.block().load(DOUBLE, &elem_ptr);
+            // Issue #323: HOLE → UNDEFINED translation for `new Array(n)` slots
+            // (see the bounded-index path in IndexGet for context).
+            let v_num_raw_bits = ctx.block().bitcast_double_to_i64(&v_num_raw);
+            let v_num_is_hole = ctx
+                .block()
+                .icmp_eq(I64, &v_num_raw_bits, crate::nanbox::TAG_HOLE_I64);
+            let v_num_undef = ctx
+                .block()
+                .bitcast_i64_to_double(crate::nanbox::TAG_UNDEFINED_I64);
+            let v_num_fast = ctx.block().select(
+                crate::types::I1,
+                &v_num_is_hole,
+                DOUBLE,
+                &v_num_undef,
+                &v_num_raw,
+            );
             let num_fast_end_lbl = ctx.block().label.clone();
             ctx.block().br(&num_inner_merge_lbl);
 

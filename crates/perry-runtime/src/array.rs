@@ -188,7 +188,19 @@ pub extern "C" fn js_array_create() -> i64 {
 
 /// Allocate a new array with the given capacity AND set length = capacity.
 /// Used for `new Array(n)` which in JavaScript creates an array with length n.
-/// Elements are NOT initialized — caller is expected to fill them before reading.
+/// Reachable slots (`0..capacity`) are initialized to TAG_HOLE — a sentinel
+/// distinct from TAG_UNDEFINED so the `in` operator and `Object.keys` can
+/// distinguish a never-written slot from one explicitly set to `undefined`.
+/// Reads via `js_array_get_f64` translate TAG_HOLE → TAG_UNDEFINED so the
+/// sentinel never leaks to user code (matches issue #323).
+/// Slots beyond `capacity` (up to `actual_capacity`) are unreachable through
+/// the bounds-checked accessor, so they're left as-is.
+///
+/// Caveat: keys-arrays built by `js_object_alloc` (via shape) and one-shot
+/// scratch arrays where the caller is about to overwrite every slot pay a
+/// tiny init cost here; the alternative — a separate uninitialized variant —
+/// would silently re-introduce the issue #323 bug class for any future caller
+/// that forgets to overwrite.
 #[no_mangle]
 pub extern "C" fn js_array_alloc_with_length(capacity: u32) -> *mut ArrayHeader {
     let actual_capacity = capacity.max(MIN_ARRAY_CAPACITY);
@@ -201,6 +213,10 @@ pub extern "C" fn js_array_alloc_with_length(capacity: u32) -> *mut ArrayHeader 
     unsafe {
         (*ptr).length = capacity; // Set length = requested capacity
         (*ptr).capacity = actual_capacity;
+        let elements_ptr = (ptr as *mut u8).add(std::mem::size_of::<ArrayHeader>()) as *mut u64;
+        for i in 0..capacity as usize {
+            std::ptr::write(elements_ptr.add(i), crate::value::TAG_HOLE);
+        }
     }
 
     ptr
@@ -386,7 +402,14 @@ pub extern "C" fn js_array_get_f64_unchecked(arr: *const ArrayHeader, index: u32
             return TAG_UNDEFINED_F64;
         }
         let elements_ptr = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
-        *elements_ptr.add(index as usize)
+        let raw = *elements_ptr.add(index as usize);
+        // Issue #323: translate HOLE sentinel (set by `new Array(n)`) back to
+        // `undefined`. The sentinel is internal — user code only ever sees
+        // TAG_UNDEFINED for unset slots.
+        if raw.to_bits() == crate::value::TAG_HOLE {
+            return TAG_UNDEFINED_F64;
+        }
+        raw
     }
 }
 
@@ -485,7 +508,13 @@ pub extern "C" fn js_array_get_f64(arr: *const ArrayHeader, index: u32) -> f64 {
             return TAG_UNDEFINED_F64;
         }
         let elements_ptr = (arr as *const u8).add(std::mem::size_of::<ArrayHeader>()) as *const f64;
-        *elements_ptr.add(index as usize)
+        let raw = *elements_ptr.add(index as usize);
+        // Issue #323: translate HOLE sentinel back to `undefined` (see
+        // `js_array_alloc_with_length` for context).
+        if raw.to_bits() == crate::value::TAG_HOLE {
+            return TAG_UNDEFINED_F64;
+        }
+        raw
     }
 }
 

@@ -47,6 +47,14 @@ pub(crate) fn refine_type_from_init(ctx: &FnCtx<'_>, init: &Expr) -> Option<HirT
         Expr::Array(_) | Expr::ArraySpread(_) => {
             Some(HirType::Array(Box::new(HirType::Any)))
         }
+        // `new Array(n)` / `new Array(a, b, ...)` — the static_type_of arm
+        // already maps this to Array<Any>, so the let-binding refinement
+        // must agree. Without it, `const xs = new Array(4); xs[i]` falls
+        // through to the generic Object index path which doesn't translate
+        // the issue #323 HOLE sentinel back to undefined.
+        Expr::New { class_name, .. } if class_name == "Array" => {
+            Some(HirType::Array(Box::new(HirType::Any)))
+        }
         Expr::ArraySlice { .. }
         | Expr::ArrayMap { .. }
         | Expr::ArrayFilter { .. }

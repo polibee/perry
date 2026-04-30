@@ -26,6 +26,15 @@ const TAG_NULL: u64 = 0x7FFC_0000_0000_0002;
 const TAG_FALSE: u64 = 0x7FFC_0000_0000_0003;
 const TAG_TRUE: u64 = 0x7FFC_0000_0000_0004;
 
+/// Issue #323: hole sentinel for sparse arrays. Slots in `new Array(n)` are
+/// initialized to this value; reads through `js_array_get_f64` translate it
+/// back to TAG_UNDEFINED so user code never observes the raw bits, while
+/// `Object.keys` and the `in` operator inspect slots directly to distinguish a
+/// hole from an explicit `undefined` write. Bits chosen in the same 0x7FFC
+/// singleton namespace, distinct from UNDEFINED/NULL/FALSE/TRUE so a NaN-box
+/// payload can never be mistaken for a hole.
+pub(crate) const TAG_HOLE: u64 = 0x7FFC_0000_0000_0010;
+
 /// Pointer tag: 0x7FFD_XXXX_XXXX_XXXX (48 bits for pointer) - objects/arrays
 const POINTER_TAG: u64 = 0x7FFD_0000_0000_0000;
 pub(crate) const POINTER_MASK: u64 = 0x0000_FFFF_FFFF_FFFF;

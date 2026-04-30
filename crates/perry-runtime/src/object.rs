@@ -1856,6 +1856,51 @@ pub extern "C" fn js_object_keys(obj: *const ObjectHeader) -> *mut ArrayHeader {
     if obj.is_null() {
         return crate::array::js_array_alloc(0);
     }
+    // Issue #323: arrays land here too (the codegen routes every `Object.keys`
+    // call through this entry point, regardless of receiver type). Treating an
+    // ArrayHeader as an ObjectHeader read garbage from the slot-0 element bits
+    // — `obj_type=length`, `keys_array=elements[1]` — which happened to look
+    // null when slots were zero-filled. After the issue #323 init-to-HOLE fix,
+    // slot[1] reads as TAG_HOLE which is non-null and segfaulted downstream.
+    // Detect arrays by GC type byte and emit string indices for non-HOLE slots.
+    let stripped = {
+        let bits = obj as u64;
+        let top16 = bits >> 48;
+        if top16 >= 0x7FF8 {
+            (bits & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader
+        } else {
+            obj
+        }
+    };
+    if !stripped.is_null() && (stripped as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+        unsafe {
+            let gc_header = (stripped as *const u8).sub(crate::gc::GC_HEADER_SIZE)
+                as *const crate::gc::GcHeader;
+            if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
+                let arr = stripped as *const crate::array::ArrayHeader;
+                let length = (*arr).length;
+                if length > 100_000 {
+                    return crate::array::js_array_alloc(0);
+                }
+                let elements = (arr as *const u8)
+                    .add(std::mem::size_of::<crate::array::ArrayHeader>())
+                    as *const u64;
+                let result = crate::array::js_array_alloc(length);
+                for i in 0..length {
+                    if std::ptr::read(elements.add(i as usize)) == crate::value::TAG_HOLE {
+                        continue;
+                    }
+                    // Format `i` as decimal into a stack buffer; SSO covers
+                    // 0..=99999 (≤5 bytes), and a length-100k array hits the
+                    // sanity-cap above so we never need a heap StringHeader.
+                    let s = i.to_string();
+                    let key_box = crate::string::js_string_new_sso(s.as_ptr(), s.len() as u32);
+                    crate::array::js_array_push_f64(result, key_box);
+                }
+                return result;
+            }
+        }
+    }
     unsafe {
         let keys = (*obj).keys_array;
         if keys.is_null() {
@@ -1976,6 +2021,58 @@ pub extern "C" fn js_object_has_property(obj: f64, key: f64) -> f64 {
     let obj_ptr = obj_val.as_pointer::<ObjectHeader>();
     if obj_ptr.is_null() {
         return nanbox_false;
+    }
+
+    // Issue #323: array fast path. `n in arr` with a numeric key was always
+    // returning false because the receiver was treated as ObjectHeader and
+    // the key-is-string guard below rejected the numeric key. Detect an
+    // ArrayHeader by GC type byte; for numeric keys check `index < length`
+    // and slot != TAG_HOLE (distinguishes a hole from an explicit
+    // `arr[i] = undefined` write, the latter overwrites HOLE with UNDEFINED).
+    if (obj_ptr as usize) >= crate::gc::GC_HEADER_SIZE + 0x1000 {
+        unsafe {
+            let gc_header = (obj_ptr as *const u8).sub(crate::gc::GC_HEADER_SIZE)
+                as *const crate::gc::GcHeader;
+            if (*gc_header).obj_type == crate::gc::GC_TYPE_ARRAY {
+                let arr = obj_ptr as *const crate::array::ArrayHeader;
+                let length = (*arr).length;
+                if length > 100_000 {
+                    return nanbox_false;
+                }
+                // Numeric key: extract the index. Accept both NaN-boxed i32
+                // and plain f64 (e.g. literal `1`) provided it's a
+                // non-negative integer in range.
+                let idx: Option<u32> = if key_val.is_int32() {
+                    let i = key_val.as_int32();
+                    if i >= 0 { Some(i as u32) } else { None }
+                } else if key_val.is_number() {
+                    let f = f64::from_bits(key_val.bits());
+                    if f >= 0.0 && f.fract() == 0.0 && f < u32::MAX as f64 {
+                        Some(f as u32)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                if let Some(idx) = idx {
+                    if idx >= length {
+                        return nanbox_false;
+                    }
+                    let elements = (arr as *const u8)
+                        .add(std::mem::size_of::<crate::array::ArrayHeader>())
+                        as *const u64;
+                    if std::ptr::read(elements.add(idx as usize)) == crate::value::TAG_HOLE {
+                        return nanbox_false;
+                    }
+                    return nanbox_true;
+                }
+                // Non-numeric key on an array: only `length` and inherited
+                // prototype methods would return true. Conservatively return
+                // false for now — out of scope for #323.
+                return nanbox_false;
+            }
+        }
     }
 
     if !key_val.is_string() {
