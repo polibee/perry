@@ -25,13 +25,13 @@ mod resolve;
 mod strip_dedup;
 mod targets;
 use collect_modules::collect_modules;
+pub use library_search::find_library;
 use library_search::{
     build_geisterhand_libs, find_geisterhand_library, find_geisterhand_runtime,
     find_geisterhand_ui, find_harmonyos_sdk, find_jsruntime_library, find_lld_link, find_llvm_tool,
     find_msvc_lib_paths, find_msvc_link_exe, find_perry_windows_sdk, find_runtime_library,
     find_stdlib_library, find_ui_library, windows_pe_subsystem_flag,
 };
-pub use library_search::find_library;
 use link::build_and_run_link;
 use object_cache::compute_object_cache_key;
 pub use object_cache::{djb2_hash, ObjectCache};

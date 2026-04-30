@@ -1363,11 +1363,11 @@ pub(super) fn build_and_run_link(
                     cmd.arg("-framework").arg("Metal");
                     cmd.arg("-framework").arg("IOKit");
                     cmd.arg("-framework").arg("DiskArbitration"); // needed by CoreGraphics
-                    // perry/media — AVPlayer is in AVFoundation (already linked
-                    // above). CoreMedia provides CMTime + CMTimeGetSeconds /
-                    // CMTimeMakeWithSeconds used for seek + position. MediaPlayer
-                    // provides MPNowPlayingInfoCenter / MPRemoteCommandCenter /
-                    // MPMediaItemArtwork (lock screen + Touch Bar + Now Playing).
+                                                                  // perry/media — AVPlayer is in AVFoundation (already linked
+                                                                  // above). CoreMedia provides CMTime + CMTimeGetSeconds /
+                                                                  // CMTimeMakeWithSeconds used for seek + position. MediaPlayer
+                                                                  // provides MPNowPlayingInfoCenter / MPRemoteCommandCenter /
+                                                                  // MPMediaItemArtwork (lock screen + Touch Bar + Now Playing).
                     cmd.arg("-framework").arg("CoreMedia");
                     cmd.arg("-framework").arg("MediaPlayer");
                 }
