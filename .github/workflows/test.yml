@@ -6,8 +6,24 @@ on:
     # Also run on version tags so `release-packages.yml` can gate publish on
     # a green Tests workflow for the exact commit being released.
     tags: ['v*']
+    # Skip docs-only pushes — every Markdown / docs example edit otherwise
+    # triggers the full ~565 multiplier-min Tests workflow even when zero
+    # code paths run. CHANGELOG.md and CLAUDE.md are explicitly NOT excluded
+    # since they ride along with code changes in the same commit and we
+    # want THOSE runs to fire. Tag pushes are unaffected (the 'tags:' arm
+    # above takes priority — paths-ignore only filters branch pushes).
+    paths-ignore:
+      - 'docs/src/**'
+      - '*.md'
+      - '!CLAUDE.md'
+      - '!CHANGELOG.md'
   pull_request:
     branches: [main]
+    paths-ignore:
+      - 'docs/src/**'
+      - '*.md'
+      - '!CLAUDE.md'
+      - '!CHANGELOG.md'
 
 concurrency:
   group: test-${{ github.ref }}
@@ -22,7 +38,10 @@ jobs:
   # Lint: cargo fmt --check (formatting gate for every PR)
   # ---------------------------------------------------------------------------
   lint:
-    runs-on: macos-14
+    # Was macos-14 — moved to ubuntu-latest in v0.5.428 since `cargo fmt
+    # --check` is portable. The 6 multiplier-min cut is small in absolute
+    # terms (lint runs in ~30s) but it's free.
+    runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
