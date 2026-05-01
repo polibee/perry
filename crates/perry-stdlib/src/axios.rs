@@ -63,7 +63,11 @@ pub unsafe extern "C" fn js_axios_get(url_ptr: *const StringHeader) -> *mut Prom
                             data,
                             headers,
                         });
-                        Ok(handle as u64)
+                        // Issue #340: NaN-box the handle as POINTER_TAG
+                        // (0x7FFD) so the awaiter sees a proper handle
+                        // value, not a subnormal float that decays to
+                        // undefined on `r.status` / `r.data` accesses.
+                        Ok((handle as u64) | 0x7FFD_0000_0000_0000)
                     }
                     Err(e) => Err(format!("Failed to read response body: {}", e)),
                 }
@@ -125,7 +129,11 @@ pub unsafe extern "C" fn js_axios_post(
                             data,
                             headers,
                         });
-                        Ok(handle as u64)
+                        // Issue #340: NaN-box the handle as POINTER_TAG
+                        // (0x7FFD) so the awaiter sees a proper handle
+                        // value, not a subnormal float that decays to
+                        // undefined on `r.status` / `r.data` accesses.
+                        Ok((handle as u64) | 0x7FFD_0000_0000_0000)
                     }
                     Err(e) => Err(format!("Failed to read response body: {}", e)),
                 }
@@ -187,7 +195,11 @@ pub unsafe extern "C" fn js_axios_put(
                             data,
                             headers,
                         });
-                        Ok(handle as u64)
+                        // Issue #340: NaN-box the handle as POINTER_TAG
+                        // (0x7FFD) so the awaiter sees a proper handle
+                        // value, not a subnormal float that decays to
+                        // undefined on `r.status` / `r.data` accesses.
+                        Ok((handle as u64) | 0x7FFD_0000_0000_0000)
                     }
                     Err(e) => Err(format!("Failed to read response body: {}", e)),
                 }
@@ -238,7 +250,11 @@ pub unsafe extern "C" fn js_axios_delete(url_ptr: *const StringHeader) -> *mut P
                             data,
                             headers,
                         });
-                        Ok(handle as u64)
+                        // Issue #340: NaN-box the handle as POINTER_TAG
+                        // (0x7FFD) so the awaiter sees a proper handle
+                        // value, not a subnormal float that decays to
+                        // undefined on `r.status` / `r.data` accesses.
+                        Ok((handle as u64) | 0x7FFD_0000_0000_0000)
                     }
                     Err(e) => Err(format!("Failed to read response body: {}", e)),
                 }
@@ -300,7 +316,11 @@ pub unsafe extern "C" fn js_axios_patch(
                             data,
                             headers,
                         });
-                        Ok(handle as u64)
+                        // Issue #340: NaN-box the handle as POINTER_TAG
+                        // (0x7FFD) so the awaiter sees a proper handle
+                        // value, not a subnormal float that decays to
+                        // undefined on `r.status` / `r.data` accesses.
+                        Ok((handle as u64) | 0x7FFD_0000_0000_0000)
                     }
                     Err(e) => Err(format!("Failed to read response body: {}", e)),
                 }

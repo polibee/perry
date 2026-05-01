@@ -470,6 +470,48 @@ pub unsafe extern "C" fn js_handle_property_dispatch(
         };
     }
 
+    // Issue #340: axios response — dispatch `r.status` / `r.data` /
+    // `r.statusText` / `r.headers` to the AxiosResponseHandle accessor
+    // shims. The handle id is registered in the common HANDLES
+    // registry; gate on registry membership AND a known property
+    // name so a colliding handle id doesn't silently return one of
+    // these slots when the user meant something else (same disjoint
+    // method-set discipline as the method dispatch above).
+    #[cfg(feature = "http-client")]
+    if matches!(
+        property_name,
+        "status" | "data" | "statusText" | "headers"
+    ) {
+        if with_handle::<crate::axios::AxiosResponseHandle, bool, _>(handle, |_| true)
+            .unwrap_or(false)
+        {
+            use perry_runtime::JSValue;
+            return match property_name {
+                "status" => crate::axios::js_axios_response_status(handle),
+                "data" => {
+                    let ptr = crate::axios::js_axios_response_data(handle);
+                    if ptr.is_null() {
+                        f64::from_bits(0x7FFC_0000_0000_0001)
+                    } else {
+                        f64::from_bits(JSValue::string_ptr(ptr).bits())
+                    }
+                }
+                "statusText" => {
+                    let ptr = crate::axios::js_axios_response_status_text(handle);
+                    if ptr.is_null() {
+                        f64::from_bits(0x7FFC_0000_0000_0001)
+                    } else {
+                        f64::from_bits(JSValue::string_ptr(ptr).bits())
+                    }
+                }
+                // headers: Vec<(String, String)> — return undefined
+                // for now (header object materialisation is its own
+                // follow-up; status / data cover the issue).
+                _ => f64::from_bits(0x7FFC_0000_0000_0001),
+            };
+        }
+    }
+
     // Unknown handle type - return undefined
     f64::from_bits(0x7FFC_0000_0000_0001)
 }

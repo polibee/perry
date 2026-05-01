@@ -3136,23 +3136,70 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             // non-OBJECT receivers through the miss handler fixes correctness
             // without giving up the PIC for real objects.
             //
+            // Issue #340/#341: small-handle guard. Receivers from
+            // native modules (axios, fastify, ioredis, better-sqlite3,
+            // ...) are NaN-boxed POINTER values whose lower-48 is a
+            // small registry id (1, 2, 3, ...). The PIC fast path
+            // below deref's `obj_handle - 8` for the GcHeader byte
+            // and `obj_handle + 16` for the keys_array slot — both
+            // SIGSEGV when `obj_handle` is a small int. Funnel
+            // small-handle receivers through the slow path so they
+            // reach the runtime's `HANDLE_PROPERTY_DISPATCH` table
+            // (axios `r.status` / `r.data`, fastify `req.query` /
+            // `req.params`, etc.).
+            //
+            // Threshold matches `js_native_call_method`'s small-handle
+            // detection (raw_ptr < 0x100000) and `js_object_get_field_by_name`'s
+            // post-#340 fix that calls HANDLE_PROPERTY_DISPATCH for
+            // these receivers.
+            // Issue #340/#341: small-handle guard. Receivers from
+            // native modules (axios, fastify, ioredis, better-sqlite3,
+            // ...) are NaN-boxed POINTER values whose lower-48 is a
+            // small registry id (1, 2, 3, ...). The PIC fast path
+            // below deref's `obj_handle - 8` for the GcHeader byte
+            // and `obj_handle + 16` for the keys_array slot — both
+            // SIGSEGV when `obj_handle` is a small int. Use a select
+            // to swap in a known-safe address (the per-site cache
+            // global itself) for the load, then AND `is_real_ptr`
+            // into the hit predicate so handle receivers cleanly
+            // miss to the slow path. The slow path
+            // (`js_object_get_field_ic_miss` →
+            // `js_object_get_field_by_name`) routes handles to
+            // `HANDLE_PROPERTY_DISPATCH` (axios `r.status` / `r.data`,
+            // fastify `req.query`, etc.).
+            //
+            // Threshold matches `js_native_call_method`'s small-handle
+            // detection (raw_ptr < 0x100000).
+            let is_real_ptr = ctx.block().icmp_ugt(I64, &obj_handle, "1048575"); // 0x100000
+
+            // Sentinel address: the per-site cache global itself —
+            // always valid, 16-byte aligned, and its bytes don't
+            // match GC_TYPE_OBJECT (=2) or an active keys_array, so
+            // the IC will cleanly miss when we substitute it for a
+            // small handle.
+            let cache_ref = format!("@{}", cache_name);
+            let cache_addr = ctx.block().ptrtoint(&cache_ref, I64);
+            let safe_obj_handle =
+                ctx.block()
+                    .select(I1, &is_real_ptr, I64, &obj_handle, &cache_addr);
+
             // GcHeader sits 8 bytes before the user pointer; obj_type is the
             // first u8 (GC_TYPE_OBJECT=2). Cost: 1 sub + 1 load i8 + 1 cmp
             // i8 + 1 and i1 — the cond_br's `is_object` operand is folded
             // into the existing branch instruction by LLVM. Branch-predicted
             // taken since real PropertyGet receivers are objects.
-            let gc_type_addr = ctx.block().sub(I64, &obj_handle, "8");
+            let gc_type_addr = ctx.block().sub(I64, &safe_obj_handle, "8");
             let gc_type_ptr = ctx.block().inttoptr(I64, &gc_type_addr);
             let gc_type = ctx.block().load(I8, &gc_type_ptr);
-            let is_object = ctx.block().icmp_eq(I8, &gc_type, "2");
+            let gc_type_ok = ctx.block().icmp_eq(I8, &gc_type, "2");
+            let is_object = ctx.block().and(I1, &is_real_ptr, &gc_type_ok);
 
             // Load obj->keys_array at offset 16 of ObjectHeader.
-            let keys_addr = ctx.block().add(I64, &obj_handle, "16");
+            let keys_addr = ctx.block().add(I64, &safe_obj_handle, "16");
             let keys_ptr_p = ctx.block().inttoptr(I64, &keys_addr);
             let keys_val = ctx.block().load(I64, &keys_ptr_p);
 
             // Load cached keys_array from the per-site global.
-            let cache_ref = format!("@{}", cache_name);
             let cache_keys_ptr = ctx.block().gep(I64, &cache_ref, &[(I64, "0")]);
             let cached_keys = ctx.block().load(I64, &cache_keys_ptr);
             let keys_eq = ctx.block().icmp_eq(I64, &keys_val, &cached_keys);

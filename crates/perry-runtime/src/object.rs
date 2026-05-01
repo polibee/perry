@@ -2191,8 +2191,32 @@ pub extern "C" fn js_object_get_field_by_name(
         if top16 >= 0x7FF8 {
             // NaN-boxed value — extract lower 48 bits as pointer
             let raw = (bits & 0x0000_FFFF_FFFF_FFFF) as *const ObjectHeader;
-            if raw.is_null() || top16 == 0x7FFC || (raw as usize) < 0x10000 {
-                // undefined/null tag, null pointer, or small handle — return undefined
+            if raw.is_null() || top16 == 0x7FFC {
+                // undefined/null tag or null pointer — return undefined
+                return JSValue::undefined();
+            }
+            // Issue #340: small-handle receivers (raw < 0x100000) come
+            // from native modules (axios, fastify, ioredis, ...) that
+            // store objects in registries and expose integer ids. The
+            // handle property dispatcher (registered by stdlib via
+            // `js_register_handle_property_dispatch`) routes the
+            // property name to the per-module accessor (e.g. axios
+            // status/data, fastify req query/params/...). Without
+            // this, every property access on those handles silently
+            // returned undefined.
+            if (raw as usize) > 0 && (raw as usize) < 0x100000 {
+                if !key.is_null() {
+                    let dispatch = unsafe { HANDLE_PROPERTY_DISPATCH };
+                    if let Some(dispatch) = dispatch {
+                        unsafe {
+                            let key_ptr = (key as *const u8)
+                                .add(std::mem::size_of::<crate::StringHeader>());
+                            let key_len = (*key).byte_len as usize;
+                            let bits = dispatch(raw as i64, key_ptr, key_len);
+                            return JSValue::from_bits(bits.to_bits());
+                        }
+                    }
+                }
                 return JSValue::undefined();
             }
             raw
@@ -2200,7 +2224,27 @@ pub extern "C" fn js_object_get_field_by_name(
             obj
         }
     };
-    if obj.is_null() || (obj as usize) < 0x1000000 {
+    if obj.is_null() {
+        return JSValue::undefined();
+    }
+    // Same handle-receiver path for already-stripped pointers — happens
+    // when the codegen passes a raw i64 handle through the slow path.
+    if (obj as usize) < 0x100000 {
+        if !key.is_null() {
+            let dispatch = unsafe { HANDLE_PROPERTY_DISPATCH };
+            if let Some(dispatch) = dispatch {
+                unsafe {
+                    let key_ptr =
+                        (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                    let key_len = (*key).byte_len as usize;
+                    let bits = dispatch(obj as i64, key_ptr, key_len);
+                    return JSValue::from_bits(bits.to_bits());
+                }
+            }
+        }
+        return JSValue::undefined();
+    }
+    if (obj as usize) < 0x1000000 {
         return JSValue::undefined();
     }
     unsafe {
@@ -2633,7 +2677,30 @@ pub extern "C" fn js_object_get_field_ic_miss(
             return f64::from_bits(v.bits());
         }
     }
-    if obj.is_null() || (obj as usize) < 0x10000 || key.is_null() {
+    if obj.is_null() || key.is_null() {
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    // Issue #340: small-handle receivers (axios, fastify, ioredis,
+    // ...) are passed here from the codegen IC miss path with the
+    // lower-48 of the NaN-box stripped — `obj as usize` is the
+    // raw handle id (1, 2, 3, ...). Route to HANDLE_PROPERTY_DISPATCH
+    // (registered by stdlib via js_register_handle_property_dispatch)
+    // so `r.status` / `r.data` and similar handle-property accesses
+    // dispatch to the per-module accessor instead of silently
+    // returning undefined.
+    if (obj as usize) > 0 && (obj as usize) < 0x100000 {
+        let dispatch = unsafe { HANDLE_PROPERTY_DISPATCH };
+        if let Some(dispatch) = dispatch {
+            unsafe {
+                let key_ptr =
+                    (key as *const u8).add(std::mem::size_of::<crate::StringHeader>());
+                let key_len = (*key).byte_len as usize;
+                return dispatch(obj as i64, key_ptr, key_len);
+            }
+        }
+        return f64::from_bits(crate::value::TAG_UNDEFINED);
+    }
+    if (obj as usize) < 0x10000 {
         return f64::from_bits(crate::value::TAG_UNDEFINED);
     }
     // When accessors are active anywhere in the program, skip the cache
