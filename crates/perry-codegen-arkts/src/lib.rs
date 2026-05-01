@@ -414,13 +414,45 @@ fn collect_mutations_in_stmt(
     compile_time_consts: &HashMap<LocalId, f64>,
 ) {
     match stmt {
-        Stmt::Expr(e) => collect_mutations_in_expr(e, enclosing.as_ref(), out),
-        Stmt::Let { init: Some(e), .. } => collect_mutations_in_expr(e, enclosing.as_ref(), out),
+        Stmt::Expr(e) => collect_mutations_in_expr(e, enclosing.as_ref(), out, bindings),
+        Stmt::Let { init: Some(e), .. } => {
+            collect_mutations_in_expr(e, enclosing.as_ref(), out, bindings)
+        }
         Stmt::If {
             condition,
             then_branch,
             else_branch,
         } => {
+            // Issue #413 — try to constant-fold the condition. When every
+            // operand bottoms out in literals (after resolving through
+            // compile_time_consts and bindings), the resulting `if (9 ===
+            // 1) { ... }` would be rejected by ArkTS's strict-mode
+            // overlap checker. Drop the dead branch entirely so the
+            // emitted source contains only the live mutators.
+            if let Some(folded) = evaluate_condition(condition, bindings, compile_time_consts) {
+                let live: &[Stmt] = if folded {
+                    then_branch
+                } else {
+                    else_branch.as_deref().unwrap_or(&[])
+                };
+                // Inherit the *enclosing* condition (None if we're at
+                // the top level) so the live branch's mutations look
+                // identical to user code that didn't write the dead
+                // `if` at all. No new group id is allocated — the
+                // resolved branch isn't a real if/else from the
+                // emitter's perspective.
+                for s in live {
+                    collect_mutations_in_stmt(
+                        s,
+                        enclosing.clone(),
+                        out,
+                        group_counter,
+                        bindings,
+                        compile_time_consts,
+                    );
+                }
+                return;
+            }
             // Each top-level if gets its own group id so the emitter can
             // collapse all mutations from the same if into a single
             // `if (cond) { ... } else { ... }` block.
@@ -504,10 +536,15 @@ fn collect_mutations_in_stmt(
 /// `Expr::NativeMethodCall { module: "perry/ui", method: "widgetAddChild",
 /// args: [LocalGet(parent), LocalGet(child), ...] }` (the first arg is
 /// always the receiver widget).
+///
+/// `bindings` is consulted by axis-aware mutators (e.g. `stackSetAlignment`)
+/// to look up the target widget's constructor — VStack vs HStack picks
+/// `HorizontalAlign.X` vs `VerticalAlign.X` per ArkUI's enum convention.
 fn collect_mutations_in_expr(
     expr: &Expr,
     cond: Option<&MutationCondition>,
     out: &mut HashMap<LocalId, Vec<MutationEntry>>,
+    bindings: &HashMap<LocalId, Expr>,
 ) {
     let Expr::NativeMethodCall {
         module: m,
@@ -673,19 +710,26 @@ fn collect_mutations_in_expr(
         }
         "stackSetAlignment" => {
             let n = numeric_arg(&args[1..], 0).unwrap_or(0.0) as i64;
-            // ArkUI uses HorizontalAlign (in Column) / VerticalAlign (in
-            // Row). We can't tell which from here; emit
-            // `.alignItems(HorizontalAlign.X)` and let ArkUI accept it
-            // for Column. For Row the user can call the v5 inline-style
-            // path instead.
             let v = match n {
                 0 => "Start",
                 1 => "Center",
                 2 => "End",
                 _ => "Start",
             };
+            // Issue #413 — ArkUI's cross-axis enum is axis-dependent:
+            // Column (= VStack) takes `HorizontalAlign.X`,
+            // Row (= HStack) takes `VerticalAlign.X`. Emitting the
+            // wrong enum produces an ArkTS strict-mode type error
+            // "Argument of type 'HorizontalAlign' is not assignable to
+            // parameter of type 'VerticalAlign'". We look up the
+            // target widget's constructor through `bindings` to pick
+            // the right one. Defaults to `HorizontalAlign` (the
+            // Column case) when the binding can't be resolved — same
+            // as v0.5.480 behavior, preserves backwards compatibility
+            // for VStack which is the common case.
+            let enum_name = stack_axis_align_enum(target_id, bindings);
             push_mut(
-                Mutation::Modifier(format!(".alignItems(HorizontalAlign.{})", v)),
+                Mutation::Modifier(format!(".alignItems({}.{})", enum_name, v)),
                 out,
                 cond,
             );
@@ -763,6 +807,30 @@ fn mutator_target_local_id(args: &[Expr]) -> Option<LocalId> {
     }
 }
 
+/// Issue #413 — return the ArkUI cross-axis alignment enum name for the
+/// stack target. Column (= VStack) takes `HorizontalAlign`; Row (=
+/// HStack) takes `VerticalAlign`. Looks up the binding for the local
+/// to discover the constructor; falls back to `HorizontalAlign` (the
+/// VStack default) when the binding can't be resolved or doesn't name
+/// a recognized stack constructor.
+fn stack_axis_align_enum(target_id: LocalId, bindings: &HashMap<LocalId, Expr>) -> &'static str {
+    let Some(init) = bindings.get(&target_id) else {
+        return "HorizontalAlign";
+    };
+    if let Expr::NativeMethodCall {
+        module: m, method, ..
+    } = init
+    {
+        if m == "perry/ui" {
+            return match method.as_str() {
+                "HStack" => "VerticalAlign",
+                _ => "HorizontalAlign",
+            };
+        }
+    }
+    "HorizontalAlign"
+}
+
 /// Build the `.backgroundColor('rgba(R, G, B, A)')` modifier string from
 /// the 4 channel args of a `widgetSetBackgroundColor(w, r, g, b, a)` call.
 /// Channels are 0..1 floats matching the perry-ui-* TS surface.
@@ -811,12 +879,46 @@ fn mutator_background_color(args: &[Expr]) -> Option<String> {
 ///    conditionality but keeping the build green. Compile-time platform
 ///    constants like `__platform__` are inlined as numeric literals via
 ///    the `compile_time_consts` map.
+///
+/// Issue #413 — defensive parenthesization on nested operators. When a
+/// resolved binding contains a Binary/Logical/Unary expression and that
+/// expression is the operand of an outer Binary/Logical/Unary, ArkTS's
+/// precedence rules can invert the user's intent. Concretely,
+/// `mobile = __platform__ === 1 || __platform__ === 2 || (!isIOS && x)`
+/// inlined as `9 === 1 || 9 === 2 && !9 === 1 && true === 1` (where
+/// `!9 === 1` parses as `(!9) === 1` instead of `!(9 === 1)`). The fix
+/// is to wrap any non-leaf serialized operand in parentheses before
+/// splicing into the parent operator string. Leaf shapes (literals,
+/// LocalGet that resolved to a literal, PropertyGet) don't need wrapping.
 fn serialize_condition(
     e: &Expr,
     bindings: &HashMap<LocalId, Expr>,
     compile_time_consts: &HashMap<LocalId, f64>,
 ) -> String {
     use perry_hir::ir::{CompareOp, LogicalOp};
+    // Wrap a sub-expression's serialized form in parentheses if the
+    // sub-expression is a Binary/Logical/Unary shape (post-resolve), so
+    // splicing into a parent operator string can't invert precedence.
+    // LocalGet recurses through resolution (compile_time_consts then
+    // bindings), so we test the *resolved* expression to decide.
+    fn needs_parens(e: &Expr, bindings: &HashMap<LocalId, Expr>) -> bool {
+        let resolved = match e {
+            Expr::LocalGet(id) => bindings.get(id).cloned(),
+            _ => None,
+        };
+        let target = resolved.as_ref().unwrap_or(e);
+        matches!(
+            target,
+            Expr::Compare { .. } | Expr::Logical { .. } | Expr::Unary { .. }
+        )
+    }
+    fn wrap(e: &Expr, bindings: &HashMap<LocalId, Expr>, ts: String) -> String {
+        if needs_parens(e, bindings) {
+            format!("({})", ts)
+        } else {
+            ts
+        }
+    }
     match e {
         Expr::Bool(true) => "true".to_string(),
         Expr::Bool(false) => "false".to_string(),
@@ -831,11 +933,13 @@ fn serialize_condition(
                 CompareOp::Gt => " > ",
                 CompareOp::Ge => " >= ",
             };
+            let l = serialize_condition(left, bindings, compile_time_consts);
+            let r = serialize_condition(right, bindings, compile_time_consts);
             format!(
                 "{}{}{}",
-                serialize_condition(left, bindings, compile_time_consts),
+                wrap(left, bindings, l),
                 op_str,
-                serialize_condition(right, bindings, compile_time_consts)
+                wrap(right, bindings, r)
             )
         }
         Expr::Logical { op, left, right } => {
@@ -844,11 +948,13 @@ fn serialize_condition(
                 LogicalOp::Or => " || ",
                 LogicalOp::Coalesce => " ?? ",
             };
+            let l = serialize_condition(left, bindings, compile_time_consts);
+            let r = serialize_condition(right, bindings, compile_time_consts);
             format!(
                 "{}{}{}",
-                serialize_condition(left, bindings, compile_time_consts),
+                wrap(left, bindings, l),
                 op_str,
-                serialize_condition(right, bindings, compile_time_consts)
+                wrap(right, bindings, r)
             )
         }
         Expr::Unary { op, operand } => {
@@ -859,11 +965,8 @@ fn serialize_condition(
                 UnaryOp::Pos => "+",
                 UnaryOp::BitNot => "~",
             };
-            format!(
-                "{}{}",
-                op_str,
-                serialize_condition(operand, bindings, compile_time_consts)
-            )
+            let inner = serialize_condition(operand, bindings, compile_time_consts);
+            format!("{}{}", op_str, wrap(operand, bindings, inner))
         }
         Expr::String(s) => arkts_string_lit(s),
         Expr::Number(n) => fmt_num(*n),
@@ -909,6 +1012,159 @@ fn serialize_condition(
         // the build stays green.
         _ => "true".to_string(),
     }
+}
+
+/// Issue #413 — try to constant-fold a condition expression. Returns
+/// `Some(true)`/`Some(false)` when every operand bottoms out in a
+/// literal (Bool/Number/Integer/String/Null/Undefined) and resolves
+/// fully through `bindings` and `compile_time_consts`. Returns `None`
+/// when any non-literal leaf is reached (e.g. PropertyGet on a runtime
+/// value, an unresolved LocalGet, a Call/NativeMethodCall, etc.).
+///
+/// The caller in `collect_mutations_in_stmt` uses this to drop dead
+/// `if` branches at harvest time. Without this, expressions like
+/// `__platform__ === 1` (after `__platform__` inlines to 9) would emit
+/// as ArkTS `if (9 === 1) { ... }` — which strict-mode ArkTS rejects
+/// with a "comparison appears to be unintentional because the types
+/// '9' and '1' have no overlap" error. By folding to `Some(false)` and
+/// dropping the `if`, we keep the emitted source legal.
+fn evaluate_condition(
+    e: &Expr,
+    bindings: &HashMap<LocalId, Expr>,
+    compile_time_consts: &HashMap<LocalId, f64>,
+) -> Option<bool> {
+    use perry_hir::ir::{CompareOp, LogicalOp, UnaryOp};
+    /// Inner repr of a fully-resolved literal value the constant-folder
+    /// can reason about. Anything not representable here returns None
+    /// from `to_lit` and propagates as the caller's None.
+    #[derive(Debug, Clone, PartialEq)]
+    enum Lit {
+        Bool(bool),
+        Num(f64),
+        Str(String),
+        Null,
+        Undefined,
+    }
+    fn to_lit(
+        e: &Expr,
+        bindings: &HashMap<LocalId, Expr>,
+        compile_time_consts: &HashMap<LocalId, f64>,
+    ) -> Option<Lit> {
+        match e {
+            Expr::Bool(b) => Some(Lit::Bool(*b)),
+            Expr::Number(n) => Some(Lit::Num(*n)),
+            Expr::Integer(n) => Some(Lit::Num(*n as f64)),
+            Expr::String(s) => Some(Lit::Str(s.clone())),
+            Expr::Null => Some(Lit::Null),
+            Expr::Undefined => Some(Lit::Undefined),
+            Expr::LocalGet(id) => {
+                if let Some(v) = compile_time_consts.get(id) {
+                    return Some(Lit::Num(*v));
+                }
+                if let Some(init) = bindings.get(id) {
+                    return to_lit(init, bindings, compile_time_consts);
+                }
+                None
+            }
+            Expr::Compare { op, left, right } => {
+                let l = to_lit(left, bindings, compile_time_consts)?;
+                let r = to_lit(right, bindings, compile_time_consts)?;
+                let res = match op {
+                    CompareOp::Eq => lit_strict_eq(&l, &r),
+                    CompareOp::Ne => !lit_strict_eq(&l, &r),
+                    CompareOp::LooseEq => lit_loose_eq(&l, &r),
+                    CompareOp::LooseNe => !lit_loose_eq(&l, &r),
+                    CompareOp::Lt | CompareOp::Le | CompareOp::Gt | CompareOp::Ge => {
+                        let (Lit::Num(a), Lit::Num(b)) = (&l, &r) else {
+                            return None;
+                        };
+                        match op {
+                            CompareOp::Lt => a < b,
+                            CompareOp::Le => a <= b,
+                            CompareOp::Gt => a > b,
+                            CompareOp::Ge => a >= b,
+                            _ => unreachable!(),
+                        }
+                    }
+                };
+                Some(Lit::Bool(res))
+            }
+            Expr::Logical { op, left, right } => {
+                let l = to_lit(left, bindings, compile_time_consts)?;
+                match op {
+                    LogicalOp::And => {
+                        if !lit_truthy(&l) {
+                            Some(l)
+                        } else {
+                            to_lit(right, bindings, compile_time_consts)
+                        }
+                    }
+                    LogicalOp::Or => {
+                        if lit_truthy(&l) {
+                            Some(l)
+                        } else {
+                            to_lit(right, bindings, compile_time_consts)
+                        }
+                    }
+                    LogicalOp::Coalesce => {
+                        if matches!(l, Lit::Null | Lit::Undefined) {
+                            to_lit(right, bindings, compile_time_consts)
+                        } else {
+                            Some(l)
+                        }
+                    }
+                }
+            }
+            Expr::Unary { op, operand } => {
+                let v = to_lit(operand, bindings, compile_time_consts)?;
+                match op {
+                    UnaryOp::Not => Some(Lit::Bool(!lit_truthy(&v))),
+                    UnaryOp::Neg => match v {
+                        Lit::Num(n) => Some(Lit::Num(-n)),
+                        _ => None,
+                    },
+                    UnaryOp::Pos => match v {
+                        Lit::Num(n) => Some(Lit::Num(n)),
+                        _ => None,
+                    },
+                    UnaryOp::BitNot => match v {
+                        Lit::Num(n) => Some(Lit::Num((!(n as i32)) as f64)),
+                        _ => None,
+                    },
+                }
+            }
+            _ => None,
+        }
+    }
+    fn lit_truthy(l: &Lit) -> bool {
+        match l {
+            Lit::Bool(b) => *b,
+            Lit::Num(n) => *n != 0.0 && !n.is_nan(),
+            Lit::Str(s) => !s.is_empty(),
+            Lit::Null | Lit::Undefined => false,
+        }
+    }
+    fn lit_strict_eq(a: &Lit, b: &Lit) -> bool {
+        match (a, b) {
+            (Lit::Bool(x), Lit::Bool(y)) => x == y,
+            (Lit::Num(x), Lit::Num(y)) => x == y,
+            (Lit::Str(x), Lit::Str(y)) => x == y,
+            (Lit::Null, Lit::Null) => true,
+            (Lit::Undefined, Lit::Undefined) => true,
+            _ => false,
+        }
+    }
+    fn lit_loose_eq(a: &Lit, b: &Lit) -> bool {
+        // `null == undefined` per spec, plus strict-eq for matching kinds.
+        // Cross-type numeric/string coercion is intentionally not
+        // implemented here — we only resolve the cases we can do safely.
+        match (a, b) {
+            (Lit::Null, Lit::Undefined) | (Lit::Undefined, Lit::Null) => true,
+            _ => lit_strict_eq(a, b),
+        }
+    }
+    let l = to_lit(e, bindings, compile_time_consts)?;
+    Some(lit_truthy(&l))
 }
 
 /// Walk a Vec<Stmt> and rewrite any `state.set(v)` calls (where state's
@@ -5307,16 +5563,18 @@ mod tests {
         // const screen = VStack([]);
         // const btn_phone = Button("phone");
         // const btn_desktop = Button("desktop");
-        // if (mobile) { widgetAddChild(screen, btn_phone); }
+        // if (props.isMobile) { widgetAddChild(screen, btn_phone); }
         // else { widgetAddChild(screen, btn_desktop); }
         // App({body: screen});
+        //
+        // The condition uses a PropertyGet, which can't be statically
+        // folded by the #413 evaluator (only literal-leaf expressions
+        // fold). The harvest emits a real `if (...) { ... } else { ... }`
+        // block in the ArkTS source.
         let mut m = empty_module();
         let screen_id: LocalId = 40;
         let phone_id: LocalId = 41;
         let desktop_id: LocalId = 42;
-        let mobile_id: LocalId = 43;
-        m.init
-            .push(let_widget(mobile_id, "mobile", Expr::Bool(true)));
         m.init.push(let_widget(
             screen_id,
             "screen",
@@ -5333,10 +5591,9 @@ mod tests {
             nmc("Button", vec![Expr::String("desktop".into())]),
         ));
         m.init.push(Stmt::If {
-            condition: Expr::Compare {
-                op: perry_hir::ir::CompareOp::Eq,
-                left: Box::new(Expr::LocalGet(mobile_id)),
-                right: Box::new(Expr::Bool(true)),
+            condition: Expr::PropertyGet {
+                object: Box::new(Expr::LocalGet(9999)),
+                property: "isMobile".to_string(),
             },
             then_branch: vec![mutator_stmt(
                 "widgetAddChild",
@@ -5519,6 +5776,11 @@ mod tests {
 
     #[test]
     fn issue_408_stack_distribution_and_alignment_emit_flexalign_modifiers() {
+        // Uses HStack, so post-#413 the alignment enum is VerticalAlign
+        // (Row's cross-axis is vertical). Pre-#413 this test asserted
+        // HorizontalAlign.Center — which ArkTS strict-mode rejected at
+        // assembleHap with "type 'HorizontalAlign' not assignable to
+        // 'VerticalAlign'".
         let mut m = empty_module();
         let id: LocalId = 90;
         m.init.push(let_widget(
@@ -5543,8 +5805,14 @@ mod tests {
             r.ets_source
         );
         assert!(
-            r.ets_source.contains(".alignItems(HorizontalAlign.Center)"),
-            "missing alignment modifier:\n{}",
+            r.ets_source.contains(".alignItems(VerticalAlign.Center)"),
+            "missing alignment modifier (HStack should pick VerticalAlign):\n{}",
+            r.ets_source
+        );
+        // Negative-pin: must NOT emit HorizontalAlign for HStack.
+        assert!(
+            !r.ets_source.contains("HorizontalAlign"),
+            "HStack must not emit HorizontalAlign:\n{}",
             r.ets_source
         );
     }
@@ -5840,8 +6108,14 @@ mod tests {
         // The ternary-style shape from #410's "Implementation steps":
         // `if (mobile) widgetAddChild(parent, phone) else widgetAddChild(parent, desktop)`
         // where `mobile` is a top-level binding referencing `__platform__`.
-        // The emitted ArkTS must contain `if (...)` and the predicate
-        // must NOT contain `__local_` or `__platform__`.
+        //
+        // Post-#413, `__platform__ === 9` constant-folds to `true` (this
+        // codegen path is harmonyos-only, where __platform__ inlines to
+        // 9), so the entire `if/else` block evaporates and ONLY the
+        // then-branch's `Button('phone')` is emitted as an
+        // unconditional child. ArkTS strict-mode previously rejected
+        // `if (9 === 9) { ... }` with a no-overlap warning; this
+        // dead-branch elimination keeps the source legal.
         let mut m = empty_module();
         let plat_id: LocalId = 1;
         let mobile_id: LocalId = 2;
@@ -5903,20 +6177,22 @@ mod tests {
             "emitted source contains the bug-1 diagnostic comment:\n{}",
             src
         );
-        // The fix inlines __platform__ as 9 — the predicate becomes "9 === 9".
+        // #413: dead-branch elimination — `9 === 9` folds to `true`, so
+        // there's no `if (...)` block at all in the emitted source for
+        // this widget; the then-branch's Button is unconditional.
         assert!(
-            src.contains("if (9 === 9)") || src.contains("if (9===9)"),
-            "expected inlined platform comparison, got:\n{}",
+            !src.contains("if (9 === 9)"),
+            "literal-only `if (9 === 9)` must be folded out (#413):\n{}",
             src
         );
         assert!(
             src.contains("Button('phone')"),
-            "missing then-branch:\n{}",
+            "missing then-branch (live after fold):\n{}",
             src
         );
         assert!(
-            src.contains("Button('desktop')"),
-            "missing else-branch:\n{}",
+            !src.contains("Button('desktop')"),
+            "else-branch should be dead after fold (#413):\n{}",
             src
         );
         // Also pin: no nested */ pattern that would cascade-break ArkTS
@@ -6042,5 +6318,577 @@ mod tests {
                 i += 1;
             }
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Issue #413 — emitted ArkUI must compile through ArkTS strict mode.
+    //
+    // Two bugs documented in the issue:
+    //
+    //   1. Literal-only comparisons in conditions: with `__platform__`
+    //      inlined to 9 (harmonyos codegen path) and bindings resolved,
+    //      a condition like `__platform__ === 1` serialized to
+    //      `9 === 1`, and ArkTS rejected `if (9 === 1) { ... }` with
+    //      a "no overlap" error. Fix: constant-fold via
+    //      `evaluate_condition` and drop dead branches at harvest time.
+    //      Operator-precedence: when a binding's init expression is
+    //      Binary/Logical/Unary and gets spliced into another such
+    //      expression, parens prevent precedence inversion (e.g.
+    //      `!isIOS` becoming `!9` then `=== 1` rather than
+    //      `!(9 === 1)`).
+    //
+    //   2. Cross-axis alignment enum on HStack: ArkUI Row's cross-axis
+    //      is vertical (uses `VerticalAlign`), Column's is horizontal
+    //      (uses `HorizontalAlign`). v0.5.480's `stackSetAlignment`
+    //      always emitted `HorizontalAlign.X`, which ArkTS rejected
+    //      for HStack with a type-mismatch error.
+    // ─────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn issue_413_evaluate_condition_folds_literal_eq_false() {
+        // 1 === 2 → Some(false)
+        let bindings = HashMap::new();
+        let consts = HashMap::new();
+        let cmp = Expr::Compare {
+            op: perry_hir::ir::CompareOp::Eq,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Integer(2)),
+        };
+        assert_eq!(evaluate_condition(&cmp, &bindings, &consts), Some(false));
+    }
+
+    #[test]
+    fn issue_413_evaluate_condition_folds_literal_eq_true() {
+        // 1 === 1 → Some(true)
+        let bindings = HashMap::new();
+        let consts = HashMap::new();
+        let cmp = Expr::Compare {
+            op: perry_hir::ir::CompareOp::Eq,
+            left: Box::new(Expr::Integer(1)),
+            right: Box::new(Expr::Integer(1)),
+        };
+        assert_eq!(evaluate_condition(&cmp, &bindings, &consts), Some(true));
+    }
+
+    #[test]
+    fn issue_413_evaluate_condition_returns_none_for_runtime_value() {
+        // PropertyGet on an unresolved local is non-foldable.
+        let bindings = HashMap::new();
+        let consts = HashMap::new();
+        let prop = Expr::PropertyGet {
+            object: Box::new(Expr::LocalGet(99)),
+            property: "isMobile".to_string(),
+        };
+        assert_eq!(evaluate_condition(&prop, &bindings, &consts), None);
+    }
+
+    #[test]
+    fn issue_413_evaluate_condition_resolves_through_compile_time_consts() {
+        // __platform__ === 9 (with __platform__ as a compile-time
+        // constant inlined to 9.0) → Some(true).
+        let plat_id: LocalId = 7;
+        let bindings = HashMap::new();
+        let mut consts = HashMap::new();
+        consts.insert(plat_id, 9.0);
+        let cmp = Expr::Compare {
+            op: perry_hir::ir::CompareOp::Eq,
+            left: Box::new(Expr::LocalGet(plat_id)),
+            right: Box::new(Expr::Integer(9)),
+        };
+        assert_eq!(evaluate_condition(&cmp, &bindings, &consts), Some(true));
+    }
+
+    #[test]
+    fn issue_413_evaluate_condition_logical_or_short_circuits() {
+        // (9 === 1) || (9 === 9) → Some(true) via short-circuit.
+        let plat_id: LocalId = 7;
+        let bindings = HashMap::new();
+        let mut consts = HashMap::new();
+        consts.insert(plat_id, 9.0);
+        let cmp = Expr::Logical {
+            op: perry_hir::ir::LogicalOp::Or,
+            left: Box::new(Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::LocalGet(plat_id)),
+                right: Box::new(Expr::Integer(1)),
+            }),
+            right: Box::new(Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::LocalGet(plat_id)),
+                right: Box::new(Expr::Integer(9)),
+            }),
+        };
+        assert_eq!(evaluate_condition(&cmp, &bindings, &consts), Some(true));
+    }
+
+    #[test]
+    fn issue_413_evaluate_condition_unary_not_negates_literal() {
+        // !true → Some(false)
+        let bindings = HashMap::new();
+        let consts = HashMap::new();
+        let neg = Expr::Unary {
+            op: perry_hir::ir::UnaryOp::Not,
+            operand: Box::new(Expr::Bool(true)),
+        };
+        assert_eq!(evaluate_condition(&neg, &bindings, &consts), Some(false));
+    }
+
+    #[test]
+    fn issue_413_literal_only_if_block_drops_dead_branch_emits_only_then() {
+        // if (1 === 2) widgetAddChild(parent, btn_a) — 1 === 2 folds to
+        // false, so the dead then-branch is dropped and nothing is
+        // appended. The parent stays empty.
+        let mut m = empty_module();
+        let parent_id: LocalId = 80;
+        let btn_a_id: LocalId = 81;
+        m.init.push(let_widget(
+            parent_id,
+            "parent",
+            nmc("VStack", vec![Expr::Array(vec![])]),
+        ));
+        m.init.push(let_widget(
+            btn_a_id,
+            "btn_a",
+            nmc("Button", vec![Expr::String("dead".into())]),
+        ));
+        m.init.push(Stmt::If {
+            condition: Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(2)),
+            },
+            then_branch: vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(btn_a_id)],
+            )],
+            else_branch: None,
+        });
+        m.init.push(app_with_body(Expr::LocalGet(parent_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            !src.contains("Button('dead')"),
+            "dead-branch button should not be emitted:\n{}",
+            src
+        );
+        // ArkTS strict-mode would have rejected `if (1 === 2)`. After
+        // the fold it never appears in the source.
+        assert!(
+            !src.contains("if (1 === 2)") && !src.contains("if (1===2)"),
+            "literal-only `if` predicate must be folded:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_literal_only_if_block_keeps_then_inlines_no_if_wrapper() {
+        // if (1 === 1) widgetAddChild(parent, btn_a) — 1 === 1 folds to
+        // true, so the live then-branch's child is inlined as an
+        // unconditional sibling and no `if (...)` wrapper is emitted.
+        let mut m = empty_module();
+        let parent_id: LocalId = 82;
+        let btn_a_id: LocalId = 83;
+        m.init.push(let_widget(
+            parent_id,
+            "parent",
+            nmc("VStack", vec![Expr::Array(vec![])]),
+        ));
+        m.init.push(let_widget(
+            btn_a_id,
+            "btn_a",
+            nmc("Button", vec![Expr::String("live".into())]),
+        ));
+        m.init.push(Stmt::If {
+            condition: Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::Integer(1)),
+                right: Box::new(Expr::Integer(1)),
+            },
+            then_branch: vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(btn_a_id)],
+            )],
+            else_branch: None,
+        });
+        m.init.push(app_with_body(Expr::LocalGet(parent_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            src.contains("Button('live')"),
+            "live-branch button must be emitted:\n{}",
+            src
+        );
+        assert!(
+            !src.contains("if (1 === 1)") && !src.contains("if (1===1)"),
+            "literal-only `if` predicate must be folded out of the source:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_platform_const_eq_drops_dead_branch_in_addchild() {
+        // Same shape as #410's repro but with __platform__ === 1 (the
+        // mobile-style check that's false on harmonyos where
+        // __platform__ === 9). Pre-#413 this serialized to
+        // `if (9 === 1) { Button('phone') } else { Button('desktop') }`
+        // which ArkTS rejected. Post-#413 it folds to `false` and only
+        // the desktop branch survives.
+        let mut m = empty_module();
+        let plat_id: LocalId = 1;
+        let parent_id: LocalId = 2;
+        let phone_id: LocalId = 3;
+        let desktop_id: LocalId = 4;
+        m.init.push(declare_const(plat_id, "__platform__"));
+        m.init.push(let_widget(
+            parent_id,
+            "parent",
+            nmc("HStack", vec![Expr::Number(0.0), Expr::Array(vec![])]),
+        ));
+        m.init.push(let_widget(
+            phone_id,
+            "phoneToolbar",
+            nmc("Button", vec![Expr::String("phone".into())]),
+        ));
+        m.init.push(let_widget(
+            desktop_id,
+            "desktopToolbar",
+            nmc("Button", vec![Expr::String("desktop".into())]),
+        ));
+        m.init.push(Stmt::If {
+            condition: Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::LocalGet(plat_id)),
+                right: Box::new(Expr::Integer(1)),
+            },
+            then_branch: vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(phone_id)],
+            )],
+            else_branch: Some(vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(desktop_id)],
+            )]),
+        });
+        m.init.push(app_with_body(Expr::LocalGet(parent_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            !src.contains("Button('phone')"),
+            "dead then-branch (9 === 1 is false) must be dropped:\n{}",
+            src
+        );
+        assert!(
+            src.contains("Button('desktop')"),
+            "live else-branch must be emitted:\n{}",
+            src
+        );
+        assert!(
+            !src.contains("if (9 === 1)") && !src.contains("if (9===1)"),
+            "literal `if (9 === 1)` must not appear:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_local_get_resolves_through_binding_to_platform_compare() {
+        // let mobile = __platform__ === 1;  (binding)
+        // if (mobile) widgetAddChild(parent, phone) else widgetAddChild(parent, desktop);
+        // Should fold the same as the inlined comparison: `mobile`
+        // resolves to `9 === 1` which is `false`, so only the desktop
+        // branch survives.
+        let mut m = empty_module();
+        let plat_id: LocalId = 1;
+        let mobile_id: LocalId = 2;
+        let parent_id: LocalId = 3;
+        let phone_id: LocalId = 4;
+        let desktop_id: LocalId = 5;
+        m.init.push(declare_const(plat_id, "__platform__"));
+        m.init.push(let_widget(
+            mobile_id,
+            "mobile",
+            Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::LocalGet(plat_id)),
+                right: Box::new(Expr::Integer(1)),
+            },
+        ));
+        m.init.push(let_widget(
+            parent_id,
+            "parent",
+            nmc("HStack", vec![Expr::Number(0.0), Expr::Array(vec![])]),
+        ));
+        m.init.push(let_widget(
+            phone_id,
+            "btn_phone",
+            nmc("Button", vec![Expr::String("phone".into())]),
+        ));
+        m.init.push(let_widget(
+            desktop_id,
+            "btn_desktop",
+            nmc("Button", vec![Expr::String("desktop".into())]),
+        ));
+        m.init.push(Stmt::If {
+            condition: Expr::LocalGet(mobile_id),
+            then_branch: vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(phone_id)],
+            )],
+            else_branch: Some(vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(desktop_id)],
+            )]),
+        });
+        m.init.push(app_with_body(Expr::LocalGet(parent_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            !src.contains("Button('phone')"),
+            "dead then-branch (mobile = 9 === 1 = false) must be dropped:\n{}",
+            src
+        );
+        assert!(
+            src.contains("Button('desktop')"),
+            "live else-branch must be emitted:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_hstack_set_alignment_emits_vertical_align_enum() {
+        // HStack (= ArkUI Row) cross-axis is vertical: must use
+        // `VerticalAlign.Start`, not `HorizontalAlign.Start`.
+        let mut m = empty_module();
+        let id: LocalId = 100;
+        m.init.push(let_widget(
+            id,
+            "row",
+            nmc("HStack", vec![Expr::Number(0.0), Expr::Array(vec![])]),
+        ));
+        m.init.push(mutator_stmt(
+            "stackSetAlignment",
+            vec![Expr::LocalGet(id), Expr::Number(0.0)], // Start
+        ));
+        m.init.push(app_with_body(Expr::LocalGet(id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            src.contains(".alignItems(VerticalAlign.Start)"),
+            "HStack must emit VerticalAlign.Start:\n{}",
+            src
+        );
+        assert!(
+            !src.contains("HorizontalAlign"),
+            "HStack must NOT emit HorizontalAlign:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_vstack_set_alignment_emits_horizontal_align_enum() {
+        // VStack (= ArkUI Column) cross-axis is horizontal: must use
+        // `HorizontalAlign.Start`. Regression-pin to ensure the new
+        // axis-aware emit didn't accidentally flip the VStack arm.
+        let mut m = empty_module();
+        let id: LocalId = 101;
+        m.init.push(let_widget(
+            id,
+            "col",
+            nmc("VStack", vec![Expr::Array(vec![])]),
+        ));
+        m.init.push(mutator_stmt(
+            "stackSetAlignment",
+            vec![Expr::LocalGet(id), Expr::Number(0.0)], // Start
+        ));
+        m.init.push(app_with_body(Expr::LocalGet(id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            src.contains(".alignItems(HorizontalAlign.Start)"),
+            "VStack must emit HorizontalAlign.Start:\n{}",
+            src
+        );
+        assert!(
+            !src.contains("VerticalAlign"),
+            "VStack must NOT emit VerticalAlign:\n{}",
+            src
+        );
+    }
+
+    #[test]
+    fn issue_413_serialize_condition_parenthesizes_unary_of_compare() {
+        // !mobile where mobile = (__platform__ === 1).
+        // After binding-resolution, the unary `!` operates on the
+        // serialized comparison. Without defensive parenthesization,
+        // the result `!9 === 1` parses as `(!9) === 1` (false === 1 →
+        // bool→num coercion → 0 === 1 → false) instead of the
+        // intended `!(9 === 1)` (== !false → true). The parens fix
+        // pins the precedence.
+        let plat_id: LocalId = 7;
+        let mobile_id: LocalId = 8;
+        let bindings = {
+            let mut b = HashMap::new();
+            b.insert(
+                mobile_id,
+                Expr::Compare {
+                    op: perry_hir::ir::CompareOp::Eq,
+                    left: Box::new(Expr::LocalGet(plat_id)),
+                    right: Box::new(Expr::Integer(1)),
+                },
+            );
+            b
+        };
+        let mut consts = HashMap::new();
+        consts.insert(plat_id, 9.0);
+        let neg = Expr::Unary {
+            op: perry_hir::ir::UnaryOp::Not,
+            operand: Box::new(Expr::LocalGet(mobile_id)),
+        };
+        let s = serialize_condition(&neg, &bindings, &consts);
+        // Must contain `!(...)` where `...` covers the comparison —
+        // i.e. the `(` immediately after `!`. The internal contents
+        // are `9 === 1` (whitespace from the operator string) so the
+        // exact substring is `!(9 === 1)`.
+        assert!(
+            s.contains("!(9 === 1)") || s.contains("!(9===1)"),
+            "expected unary-not to wrap binding-resolved comparison in parens, got: {}",
+            s
+        );
+        // Negative-pin: the unparenthesized form `!9 === 1` must NOT
+        // appear (which would parse as `(!9) === 1`).
+        assert!(
+            !s.contains("!9 === 1") && !s.contains("!9===1"),
+            "unparenthesized `!9 === 1` precedence-inversion bug regressed: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn issue_413_serialize_condition_parenthesizes_or_chain_with_unary() {
+        // mobile = __platform__ === 1 || __platform__ === 2 || (!isIOS && x)
+        // where isIOS = __platform__ === 1 (so isIOS = false, and
+        // !isIOS = true), and x is an unresolved PropertyGet so the
+        // whole chain doesn't fold to a literal — it stays a runtime
+        // condition. The serialized chain must parenthesize each
+        // sub-Binary/Unary so precedence can't invert.
+        let plat_id: LocalId = 7;
+        let isios_id: LocalId = 9;
+        let mut bindings = HashMap::new();
+        bindings.insert(
+            isios_id,
+            Expr::Compare {
+                op: perry_hir::ir::CompareOp::Eq,
+                left: Box::new(Expr::LocalGet(plat_id)),
+                right: Box::new(Expr::Integer(1)),
+            },
+        );
+        let mut consts = HashMap::new();
+        consts.insert(plat_id, 9.0);
+        // (__platform__ === 1) || (__platform__ === 2) || (!isIOS && something)
+        let chain = Expr::Logical {
+            op: perry_hir::ir::LogicalOp::Or,
+            left: Box::new(Expr::Logical {
+                op: perry_hir::ir::LogicalOp::Or,
+                left: Box::new(Expr::Compare {
+                    op: perry_hir::ir::CompareOp::Eq,
+                    left: Box::new(Expr::LocalGet(plat_id)),
+                    right: Box::new(Expr::Integer(1)),
+                }),
+                right: Box::new(Expr::Compare {
+                    op: perry_hir::ir::CompareOp::Eq,
+                    left: Box::new(Expr::LocalGet(plat_id)),
+                    right: Box::new(Expr::Integer(2)),
+                }),
+            }),
+            right: Box::new(Expr::Logical {
+                op: perry_hir::ir::LogicalOp::And,
+                left: Box::new(Expr::Unary {
+                    op: perry_hir::ir::UnaryOp::Not,
+                    operand: Box::new(Expr::LocalGet(isios_id)),
+                }),
+                right: Box::new(Expr::PropertyGet {
+                    object: Box::new(Expr::LocalGet(99)), // unresolvable
+                    property: "x".to_string(),
+                }),
+            }),
+        };
+        let s = serialize_condition(&chain, &bindings, &consts);
+        // The buggy serialization documented in the issue:
+        //     `9 === 1 || 9 === 2 && !9 === 1 && true === 1`
+        // (note `!9 === 1` and `true === 1`). Post-fix these specific
+        // substrings must NOT appear.
+        assert!(
+            !s.contains("!9 === 1") && !s.contains("!9===1"),
+            "precedence-inverted `!9 === 1` regressed: {}",
+            s
+        );
+        // Unary `!` must wrap the resolved comparison in parens.
+        assert!(
+            s.contains("!(9 === 1)") || s.contains("!(9===1)"),
+            "expected unary-not paren-wrap: {}",
+            s
+        );
+    }
+
+    #[test]
+    fn issue_413_addchild_inside_unfoldable_runtime_condition_still_emits_if() {
+        // Sanity check: the dead-branch elimination must NOT fire when
+        // the condition is unfoldable. PropertyGet on a runtime value
+        // stays as a runtime `if (...) { ... } else { ... }` block.
+        let mut m = empty_module();
+        let parent_id: LocalId = 110;
+        let a_id: LocalId = 111;
+        let b_id: LocalId = 112;
+        m.init.push(let_widget(
+            parent_id,
+            "parent",
+            nmc("VStack", vec![Expr::Array(vec![])]),
+        ));
+        m.init.push(let_widget(
+            a_id,
+            "btn_a",
+            nmc("Button", vec![Expr::String("a".into())]),
+        ));
+        m.init.push(let_widget(
+            b_id,
+            "btn_b",
+            nmc("Button", vec![Expr::String("b".into())]),
+        ));
+        m.init.push(Stmt::If {
+            condition: Expr::PropertyGet {
+                object: Box::new(Expr::LocalGet(9999)),
+                property: "isMobile".to_string(),
+            },
+            then_branch: vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(a_id)],
+            )],
+            else_branch: Some(vec![mutator_stmt(
+                "widgetAddChild",
+                vec![Expr::LocalGet(parent_id), Expr::LocalGet(b_id)],
+            )]),
+        });
+        m.init.push(app_with_body(Expr::LocalGet(parent_id)));
+        let r = emit_index_ets(&mut m).unwrap().unwrap();
+        let src = &r.ets_source;
+        assert!(
+            src.contains("if ("),
+            "runtime condition must still emit `if (...)`:\n{}",
+            src
+        );
+        assert!(
+            src.contains("} else {"),
+            "runtime condition must still emit `}} else {{`:\n{}",
+            src
+        );
+        assert!(
+            src.contains("Button('a')"),
+            "then-branch must render:\n{}",
+            src
+        );
+        assert!(
+            src.contains("Button('b')"),
+            "else-branch must render:\n{}",
+            src
+        );
     }
 }
