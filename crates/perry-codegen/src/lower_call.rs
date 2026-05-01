@@ -6964,6 +6964,46 @@ const NATIVE_MODULE_TABLE: &[NativeModSig] = &[
         args: &[],
         ret: NR_STR,
     },
+    // ========== readline (#347 Phase 1) ==========
+    // createInterface(opts) returns a Handle (i64, NaN-boxed POINTER).
+    // Instance methods take that Handle as the first arg via has_receiver.
+    // Callbacks come in as NA_PTR (unboxed *const ClosureHeader as i64).
+    NativeModSig {
+        module: "readline",
+        has_receiver: false,
+        method: "createInterface",
+        class_filter: None,
+        runtime: "js_readline_create_interface",
+        args: &[NA_F64],
+        ret: NR_PTR,
+    },
+    NativeModSig {
+        module: "readline",
+        has_receiver: true,
+        method: "question",
+        class_filter: None,
+        runtime: "js_readline_question",
+        args: &[NA_STR, NA_PTR],
+        ret: NR_VOID,
+    },
+    NativeModSig {
+        module: "readline",
+        has_receiver: true,
+        method: "on",
+        class_filter: None,
+        runtime: "js_readline_on",
+        args: &[NA_STR, NA_PTR],
+        ret: NR_VOID,
+    },
+    NativeModSig {
+        module: "readline",
+        has_receiver: true,
+        method: "close",
+        class_filter: None,
+        runtime: "js_readline_close",
+        args: &[],
+        ret: NR_VOID,
+    },
     // ========== worker_threads ==========
     NativeModSig {
         module: "worker_threads",

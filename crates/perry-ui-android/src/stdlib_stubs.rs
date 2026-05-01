@@ -1595,6 +1595,33 @@ pub extern "C" fn js_validator_is_url() -> i64 {
 pub extern "C" fn js_validator_is_uuid() -> i64 {
     0
 }
+// readline (#347) — TUI use case isn't relevant on Android, so stubs
+// return inert values (handle 0, no-op for everything). The `_active`
+// stub returns 0 so the host event loop doesn't keep ticking.
+#[no_mangle]
+pub extern "C" fn js_readline_create_interface() -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn js_readline_question() -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn js_readline_on() -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn js_readline_close() -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn js_readline_process_pending() -> i64 {
+    0
+}
+#[no_mangle]
+pub extern "C" fn js_readline_has_active() -> i64 {
+    0
+}
 #[no_mangle]
 pub extern "C" fn js_worker_threads_get_worker_data() -> i64 {
     0

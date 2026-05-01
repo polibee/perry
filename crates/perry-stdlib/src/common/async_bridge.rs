@@ -131,7 +131,14 @@ where
 
 /// Register js_stdlib_process_pending with perry-runtime's pump so that
 /// perry-ui-macos can call it without a hard link dependency on perry-stdlib.
-fn ensure_pump_registered() {
+///
+/// Public because non-await modules that nonetheless need the event loop
+/// to keep ticking — readline (#347), and any future TUI-shaped module
+/// that uses thread-local pending queues without ever calling
+/// `spawn_for_promise` — must register the pump explicitly the first time
+/// they're touched. Otherwise the runtime exits immediately when `main`
+/// returns and the close/line callbacks never fire.
+pub fn ensure_pump_registered() {
     use std::sync::Once;
     static REGISTER: Once = Once::new();
     REGISTER.call_once(|| {
@@ -233,6 +240,10 @@ pub extern "C" fn js_stdlib_process_pending() -> i32 {
     // Process pending worker_threads messages (stdin reader)
     count += crate::worker_threads::js_worker_threads_process_pending();
 
+    // Process pending readline lines (#347 Phase 1) — drains the stdin
+    // reader's queue and dispatches to question/line/close callbacks.
+    count += crate::readline::js_readline_process_pending();
+
     count
 }
 
@@ -277,6 +288,12 @@ pub extern "C" fn js_stdlib_has_active_handles() -> i32 {
         if has_net != 0 {
             return 1;
         }
+    }
+    // readline (#347 Phase 1) — keep the loop alive while a stdin
+    // reader is started and EOF hasn't been observed, so `rl.on('line')`
+    // / `rl.question()` programs don't exit before the user types.
+    if crate::readline::js_readline_has_active() != 0 {
+        return 1;
     }
     0
 }

@@ -107,6 +107,10 @@ pub const NATIVE_MODULES: &[&str] = &[
     "fastify",
     // Node.js built-in modules
     "async_hooks",
+    // readline — line-buffered + raw-mode stdin reader (#347).
+    // Lives in perry-stdlib (background reader thread + drain queue),
+    // so it requires_stdlib (not in RUNTIME_ONLY_MODULES).
+    "readline",
     // Closes #360 item #2: ink does both `import process from 'node:process'`
     // (default import) and `import { cwd } from 'node:process'` (named import
     // of process.cwd) across 8 build files. Without this entry, both shapes

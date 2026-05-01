@@ -29,6 +29,7 @@ pub mod exponential_backoff;
 pub mod lodash;
 pub mod lru_cache;
 pub mod moment;
+pub mod readline;
 pub mod slugify;
 pub mod worker_threads;
 
@@ -44,6 +45,7 @@ pub use exponential_backoff::*;
 pub use lodash::*;
 pub use lru_cache::*;
 pub use moment::*;
+pub use readline::*;
 pub use slugify::*;
 pub use worker_threads::*;
 

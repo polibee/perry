@@ -1132,6 +1132,15 @@ pub(crate) fn lower_var_decl_with_destructuring(
                                             // `job.stop()` falls through to dynamic dispatch and the
                                             // call never reaches js_cron_job_stop.
                                             ("node-cron", "schedule") => Some("CronJob"),
+                                            // readline.createInterface() returns a singleton
+                                            // handle whose .question/.on/.close methods
+                                            // dispatch via the ("readline", true, METHOD)
+                                            // entries in lower_call.rs's native_module dispatch
+                                            // table. Without registering the result as a
+                                            // "Interface" native instance, those calls fall
+                                            // through to dynamic dispatch and never reach
+                                            // js_readline_question / js_readline_on / etc.
+                                            ("readline", "createInterface") => Some("Interface"),
                                             _ => None,
                                         };
                                         if let Some(class_name) = class_name {
