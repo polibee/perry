@@ -1028,53 +1028,23 @@ pub fn gc_collect_minor() -> u64 {
     // RSS win lands accordingly.
 
     // === AGE-BUMP PASS (gen-GC Phase C4) ===
-    // After tracing, any nursery object still carrying
-    // GC_FLAG_MARKED has survived this collection. Two-bit aging
-    // (HAS_SURVIVED → TENURED) gives PROMOTION_AGE=2:
+    // Folded into the sweep walk via `sweep_with_age_bump(true)` below.
+    // Each general-arena object header was walked twice per minor GC: once
+    // here for HAS_SURVIVED/TENURED bookkeeping, once in sweep for the
+    // mark/free decision. With ~1.6M objects per cycle in
+    // perf-comprehensive that doubled the per-cycle header-touch cost; the
+    // merged walk halves it. Aging applies to nursery only (gated on
+    // `block_idx < general_block_count()` inside the merged walk), matching
+    // the original `pointer_in_old_gen` skip.
+    //
+    // Two-bit aging (HAS_SURVIVED → TENURED) gives PROMOTION_AGE=2:
     //   - First survival:  set HAS_SURVIVED.
     //   - Second survival: set TENURED, clear HAS_SURVIVED.
     //
-    // Tenured objects are skipped by `drain_trace_worklist_minor`
-    // on subsequent minor GCs — bounded by the time-win
-    // generational design promises. They stay PHYSICALLY in nursery
-    // (no copying) so RSS doesn't drop until Phase C4b lands real
-    // evacuation; this commit is the time-win half of C4.
-    //
-    // Skip OLD_ARENA objects (already old; no aging needed) and
-    // non-arena objects (malloc'd strings/closures/etc. — they
-    // don't go through nursery in this design; their lifetime is
-    // managed by MALLOC_STATE sweep regardless of generation).
-    crate::arena::arena_walk_objects(|header_ptr| {
-        let header = header_ptr as *mut GcHeader;
-        unsafe {
-            let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
-            // Skip OLD_ARENA objects.
-            if crate::arena::pointer_in_old_gen(user_ptr as usize) {
-                return;
-            }
-            // Only age objects that survived this trace. MARKED
-            // (reached transitively from roots) OR PINNED (kept
-            // alive by sweep regardless of mark) — the latter
-            // matches block-persist's "still alive" predicate.
-            if (*header).gc_flags & (GC_FLAG_MARKED | GC_FLAG_PINNED) == 0 {
-                return;
-            }
-            let flags = (*header).gc_flags;
-            if flags & GC_FLAG_TENURED != 0 {
-                // Already tenured — nothing to do.
-                return;
-            }
-            if flags & GC_FLAG_HAS_SURVIVED != 0 {
-                // Second survival: promote to tenured, clear the
-                // intermediate aging bit.
-                (*header).gc_flags = (flags | GC_FLAG_TENURED) & !GC_FLAG_HAS_SURVIVED;
-            } else {
-                // First survival: mark HAS_SURVIVED, will tenure
-                // on next minor GC.
-                (*header).gc_flags = flags | GC_FLAG_HAS_SURVIVED;
-            }
-        }
-    });
+    // Tenured objects are skipped by `drain_trace_worklist_minor` on
+    // subsequent minor GCs — bounded by the time-win generational design
+    // promises. They stay PHYSICALLY in nursery (no copying) so RSS
+    // doesn't drop until Phase C4b lands real evacuation.
 
     // === EVACUATION PASS (Phase C4b-β + C4b-γ-2, opt-in) ===
     // Copy non-pinned tenured nursery objects into OLD_ARENA and
@@ -1102,7 +1072,10 @@ pub fn gc_collect_minor() -> u64 {
     }
 
     // === SWEEP PHASE ===
-    let freed_bytes = sweep();
+    // `do_age_bump = true` folds the per-object HAS_SURVIVED / TENURED
+    // update into this same walk (see comment block above the removed
+    // dedicated age-bump pass).
+    let freed_bytes = sweep_with_age_bump(true);
 
     // RS clear — see gc_collect_inner for the rationale.
     REMEMBERED_SET.with(|s| s.borrow_mut().clear());
@@ -2417,6 +2390,24 @@ unsafe fn trace_error(
 /// Sweep: free unmarked malloc objects; add unmarked arena objects to free list.
 /// Returns total bytes freed.
 fn sweep() -> u64 {
+    sweep_with_age_bump(false)
+}
+
+/// Sweep variant that folds the minor-GC age-bump pass into the same arena walk.
+///
+/// `gc_collect_minor` previously did:
+///   1. arena_walk_objects to update HAS_SURVIVED/TENURED on marked young objects
+///   2. arena_walk_objects_with_block_index in `sweep` to free dead objects and
+///      compute block_has_live
+///
+/// Both walks visit every arena object header. With ~1.6M objects per cycle in
+/// perf-comprehensive, removing the dedicated age-bump walk saves ~10ms/cycle
+/// and avoids touching every header twice. The age-bump update is folded into
+/// the sweep walk's "alive" branches, gated on `block_idx < general_n` so only
+/// general-arena (nursery) objects age — longlived and old-gen are skipped, as
+/// in the original standalone age-bump pass (which used `pointer_in_old_gen`
+/// for the same gate).
+fn sweep_with_age_bump(do_age_bump: bool) -> u64 {
     let mut freed_bytes: u64 = 0;
 
     // Sweep malloc objects. Issue #62: unified state borrow lets us remove from
@@ -2516,15 +2507,40 @@ fn sweep() -> u64 {
     // across GC cycles instead of page-faulting through fresh blocks.
     let n_blocks = crate::arena::arena_block_count();
     let mut block_has_live: Vec<bool> = vec![false; n_blocks];
+    // Inclusive upper bound on indices that age. `general_block_count()`
+    // is the first non-general index; objects with `block_idx < general_n`
+    // are nursery-resident and need the age-bump update.
+    let general_n = if do_age_bump {
+        crate::arena::general_block_count()
+    } else {
+        0
+    };
 
     crate::arena::arena_walk_objects_with_block_index(|header_ptr, block_idx| {
         let header = header_ptr as *mut GcHeader;
         unsafe {
-            if (*header).gc_flags & GC_FLAG_PINNED != 0 {
+            // Age-bump for surviving general-arena (nursery) objects, folded
+            // into this walk so the standalone `arena_walk_objects` pass in
+            // gc_collect_minor can be eliminated. Mirrors the original
+            // age-bump's gate (skip old-gen, skip already-tenured, skip
+            // unmarked-and-unpinned) and runs BEFORE the mark bit is
+            // cleared so the MARKED check stays meaningful.
+            let age_bump_this = do_age_bump && block_idx < general_n;
+            let flags = (*header).gc_flags;
+            if flags & GC_FLAG_PINNED != 0 {
                 if block_idx < block_has_live.len() {
                     block_has_live[block_idx] = true;
                 }
-                (*header).gc_flags &= !GC_FLAG_MARKED;
+                if age_bump_this && flags & GC_FLAG_TENURED == 0 {
+                    if flags & GC_FLAG_HAS_SURVIVED != 0 {
+                        (*header).gc_flags =
+                            (flags | GC_FLAG_TENURED) & !GC_FLAG_HAS_SURVIVED & !GC_FLAG_MARKED;
+                    } else {
+                        (*header).gc_flags = (flags | GC_FLAG_HAS_SURVIVED) & !GC_FLAG_MARKED;
+                    }
+                } else {
+                    (*header).gc_flags = flags & !GC_FLAG_MARKED;
+                }
                 return;
             }
             // FORWARDED objects must keep their containing block alive.
@@ -2542,14 +2558,14 @@ fn sweep() -> u64 {
             // iterated zero entities. Treat FORWARDED as live for the
             // block-keep gate; the OLD payload is just an 8-byte
             // forwarding pointer, harmless to retain.
-            if (*header).gc_flags & GC_FLAG_FORWARDED != 0 {
+            if flags & GC_FLAG_FORWARDED != 0 {
                 if block_idx < block_has_live.len() {
                     block_has_live[block_idx] = true;
                 }
-                (*header).gc_flags &= !GC_FLAG_MARKED;
+                (*header).gc_flags = flags & !GC_FLAG_MARKED;
                 return;
             }
-            if (*header).gc_flags & GC_FLAG_MARKED == 0 {
+            if flags & GC_FLAG_MARKED == 0 {
                 let total_size = (*header).size as usize;
                 let user_ptr = (header as *mut u8).add(GC_HEADER_SIZE);
                 freed_bytes += total_size as u64;
@@ -2573,7 +2589,16 @@ fn sweep() -> u64 {
                 if block_idx < block_has_live.len() {
                     block_has_live[block_idx] = true;
                 }
-                (*header).gc_flags &= !GC_FLAG_MARKED;
+                if age_bump_this && flags & GC_FLAG_TENURED == 0 {
+                    if flags & GC_FLAG_HAS_SURVIVED != 0 {
+                        (*header).gc_flags =
+                            (flags | GC_FLAG_TENURED) & !GC_FLAG_HAS_SURVIVED & !GC_FLAG_MARKED;
+                    } else {
+                        (*header).gc_flags = (flags | GC_FLAG_HAS_SURVIVED) & !GC_FLAG_MARKED;
+                    }
+                } else {
+                    (*header).gc_flags = flags & !GC_FLAG_MARKED;
+                }
             }
         }
     });
