@@ -532,6 +532,9 @@ pub fn declare_phase_b_strings(module: &mut LlModule) {
     module.declare_function("js_set_foreach", VOID, &[I64, DOUBLE]);
     // Set to array conversion (for Set iteration via for...of)
     module.declare_function("js_set_to_array", I64, &[I64]);
+    // Direct element access for the `for (const x of set)` fast path —
+    // skips the throwaway Array allocation that `js_set_to_array` would do.
+    module.declare_function("js_set_value_at", DOUBLE, &[I64, I32]);
     // Splice is unusual: takes an out-pointer for the deleted array
     // and returns the modified-in-place input (the splice point may
     // realloc). Param order is (arr, start, delete_count, items_ptr,

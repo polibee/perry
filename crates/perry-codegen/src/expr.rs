@@ -5539,6 +5539,19 @@ pub(crate) fn lower_expr(ctx: &mut FnCtx<'_>, expr: &Expr) -> Result<String> {
             Ok(blk.call(DOUBLE, runtime_fn, &[(I64, &m_handle), (I32, &i_i32)]))
         }
 
+        // -------- Set direct-element fast path --------
+        // Counterpart to MapEntryValueAt: read the i-th element of a Set
+        // without materializing the buffer into an Array. Used by the
+        // `for (const x of setExpr)` HIR fast path.
+        Expr::SetValueAt { set, idx } => {
+            let s_box = lower_expr(ctx, set)?;
+            let i_dbl = lower_expr(ctx, idx)?;
+            let blk = ctx.block();
+            let s_handle = unbox_to_i64(blk, &s_box);
+            let i_i32 = blk.fptosi(DOUBLE, &i_dbl, I32);
+            Ok(blk.call(DOUBLE, "js_set_value_at", &[(I64, &s_handle), (I32, &i_i32)]))
+        }
+
         // -------- Set.values (set → array conversion for iteration) --------
         Expr::SetValues(set) => {
             let s_box = lower_expr(ctx, set)?;

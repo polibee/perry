@@ -388,6 +388,26 @@ pub extern "C" fn js_set_clear(set: *mut SetHeader) {
     });
 }
 
+/// Direct read of the i-th element in insertion order — counterpart to
+/// `js_map_entry_value_at`. Lets the codegen iterate `for (const x of set)`
+/// without materializing the elements buffer into a transient Array via
+/// `js_set_to_array`. Returns `undefined` (NaN-box) for out-of-range / null.
+#[no_mangle]
+pub extern "C" fn js_set_value_at(set: *const SetHeader, i: u32) -> f64 {
+    const UNDEF: u64 = 0x7FFC_0000_0000_0001;
+    let set = clean_set_ptr(set);
+    if set.is_null() {
+        return f64::from_bits(UNDEF);
+    }
+    unsafe {
+        if i >= (*set).size {
+            return f64::from_bits(UNDEF);
+        }
+        let elements = (*set).elements as *const f64;
+        ptr::read(elements.add(i as usize))
+    }
+}
+
 /// Convert a Set to an Array (for Array.from(set))
 /// Returns a new array containing all elements of the set
 #[no_mangle]

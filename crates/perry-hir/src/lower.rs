@@ -5581,6 +5581,23 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                     },
                     _ => false,
                 };
+            // Fast path: `for (const x of setExpr)` with a single-Ident
+            // binding. Reads elements directly via `SetValueAt` (→
+            // `js_set_value_at`) instead of materializing the buffer with
+            // `js_set_to_array`. ECS hot paths (changeset.removes, etc.)
+            // iterate Sets repeatedly; this saves an Array alloc per loop.
+            let is_iterable_set = matches!(
+                &iterable_type,
+                Some(Type::Generic { base, .. }) if base == "Set"
+            );
+            let set_fastpath = is_iterable_set
+                && match &for_of_stmt.left {
+                    ast::ForHead::VarDecl(var_decl) => match var_decl.decls.first() {
+                        Some(decl) => matches!(&decl.name, ast::Pat::Ident(_)),
+                        None => false,
+                    },
+                    _ => false,
+                };
             let arr_expr = match &iterable_type {
                 Some(Type::Generic { base, type_args }) if base == "Map" => {
                     if type_args.len() >= 2 {
@@ -5596,7 +5613,13 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                     }
                 }
                 Some(Type::Generic { base, .. }) if base == "Set" => {
-                    Expr::SetValues(Box::new(arr_expr))
+                    if set_fastpath {
+                        // Keep the raw set expression — fast path reads
+                        // elements directly via SetValueAt below.
+                        arr_expr
+                    } else {
+                        Expr::SetValues(Box::new(arr_expr))
+                    }
                 }
                 _ => arr_expr,
             };
@@ -5641,6 +5664,11 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                         map_key_type.clone().unwrap_or(Type::Any),
                         map_val_type.clone().unwrap_or(Type::Any),
                     ],
+                }
+            } else if set_fastpath {
+                Type::Generic {
+                    base: "Set".to_string(),
+                    type_args: vec![elem_type.clone()],
                 }
             } else {
                 Type::Array(Box::new(elem_type.clone()))
@@ -5755,12 +5783,20 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                             ast::Pat::Ident(_) => {
                                 // Simple binding: for (const x of arr)
                                 let (name, id) = var_ids[0].clone();
+                                let init = if set_fastpath {
+                                    Expr::SetValueAt {
+                                        set: Box::new(Expr::LocalGet(arr_id)),
+                                        idx: Box::new(Expr::LocalGet(idx_id)),
+                                    }
+                                } else {
+                                    item_expr
+                                };
                                 vec![Stmt::Let {
                                     id,
                                     name,
                                     ty: elem_type.clone(),
                                     mutable: false,
-                                    init: Some(item_expr),
+                                    init: Some(init),
                                 }]
                             }
                             ast::Pat::Array(arr_pat) => {
@@ -5954,10 +5990,10 @@ fn lower_stmt(ctx: &mut LoweringContext, module: &mut Module, stmt: &ast::Stmt) 
                 loop_body.insert(i, stmt);
             }
 
-            // Loop bound. Fast path reads `__m.size` (lowered by codegen
-            // to `js_map_size`); regular path uses `__arr.length` against
-            // the materialized iterable.
-            let bound_expr = if map_kv_fastpath {
+            // Loop bound. Map/Set fast paths read `.size` (lowered by
+            // codegen to `js_map_size` / `js_set_size`); regular path uses
+            // `__arr.length` against the materialized iterable.
+            let bound_expr = if map_kv_fastpath || set_fastpath {
                 Expr::PropertyGet {
                     object: Box::new(Expr::LocalGet(arr_id)),
                     property: "size".to_string(),

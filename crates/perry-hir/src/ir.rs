@@ -1727,6 +1727,14 @@ pub enum Expr {
     SetSize(Box<Expr>),         // set.size -> number
     SetClear(Box<Expr>),        // set.clear() -> void
     SetValues(Box<Expr>),       // set.values() -> Array (via js_set_to_array)
+    /// `js_set_value_at(set, idx)` — read the i-th element in insertion
+    /// order. Used by the `for (const x of setExpr)` fast path so the loop
+    /// reads elements directly without materializing the buffer into an
+    /// Array via `js_set_to_array`. Caller bounds the loop with `SetSize`.
+    SetValueAt {
+        set: Box<Expr>,
+        idx: Box<Expr>,
+    },
 
     // Sequence expression (comma operator)
     Sequence(Vec<Expr>),

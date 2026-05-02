@@ -3757,10 +3757,25 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                     },
                     _ => false,
                 };
+            // Fast path: `for (const x of setExpr)` reads elements directly
+            // via `SetValueAt` (→ `js_set_value_at`) instead of materializing
+            // the buffer with `js_set_to_array`.
+            let is_iterable_set = matches!(
+                &iterable_type,
+                Some(Type::Generic { base, .. }) if base == "Set"
+            );
+            let set_fastpath = is_iterable_set
+                && match &for_of_stmt.left {
+                    ast::ForHead::VarDecl(var_decl) => match var_decl.decls.first() {
+                        Some(decl) => matches!(&decl.name, ast::Pat::Ident(_)),
+                        None => false,
+                    },
+                    _ => false,
+                };
             // If the iterable is a Map or Set, wrap in MapEntries / SetValues
             // to materialize it as an array for the index-based loop.
-            // Fast-path Map+[k,v] iterables stay unwrapped — the loop reads
-            // entries directly via runtime helpers below.
+            // Fast-path Map+[k,v] / Set+ident iterables stay unwrapped — the
+            // loop reads entries directly via runtime helpers below.
             let arr_expr = match &iterable_type {
                 Some(Type::Generic { base, .. }) if base == "Map" => {
                     if map_kv_fastpath {
@@ -3770,7 +3785,11 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                     }
                 }
                 Some(Type::Generic { base, .. }) if base == "Set" => {
-                    Expr::SetValues(Box::new(arr_expr))
+                    if set_fastpath {
+                        arr_expr
+                    } else {
+                        Expr::SetValues(Box::new(arr_expr))
+                    }
                 }
                 _ => arr_expr,
             };
@@ -3812,6 +3831,21 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                     if base == "Map" && type_args.len() >= 2 {
                         Type::Generic {
                             base: "Map".to_string(),
+                            type_args,
+                        }
+                    } else {
+                        Type::Any
+                    }
+                } else {
+                    Type::Any
+                }
+            } else if set_fastpath {
+                // Holder typed as Set so `__s.size` resolves through
+                // `is_set_expr` to `js_set_size` instead of `.length`.
+                if let Some(Type::Generic { base, type_args }) = iterable_type.clone() {
+                    if base == "Set" {
+                        Type::Generic {
+                            base: "Set".to_string(),
                             type_args,
                         }
                     } else {
@@ -3932,12 +3966,20 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                         match &decl.name {
                             ast::Pat::Ident(_) => {
                                 let (name, id) = var_ids[0].clone();
+                                let init = if set_fastpath {
+                                    Expr::SetValueAt {
+                                        set: Box::new(Expr::LocalGet(arr_id)),
+                                        idx: Box::new(Expr::LocalGet(idx_id)),
+                                    }
+                                } else {
+                                    item_expr
+                                };
                                 vec![Stmt::Let {
                                     id,
                                     name,
                                     ty: item_hir_type.clone(),
                                     mutable: false,
-                                    init: Some(item_expr),
+                                    init: Some(init),
                                 }]
                             }
                             ast::Pat::Array(arr_pat) => {
@@ -4109,9 +4151,9 @@ pub(crate) fn lower_body_stmt(ctx: &mut LoweringContext, stmt: &ast::Stmt) -> Re
                 loop_body.insert(i, stmt);
             }
 
-            // Loop bound: fast path uses `__m.size` (codegen-recognized,
-            // lowered to js_map_size), regular path uses .length.
-            let bound_expr = if map_kv_fastpath {
+            // Loop bound: Map/Set fast paths use `.size` (codegen-recognized,
+            // lowered to js_map_size / js_set_size), regular path uses .length.
+            let bound_expr = if map_kv_fastpath || set_fastpath {
                 Expr::PropertyGet {
                     object: Box::new(Expr::LocalGet(arr_id)),
                     property: "size".to_string(),
