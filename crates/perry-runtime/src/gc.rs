@@ -1299,7 +1299,16 @@ impl ValidPointerSet {
         self.sorted.push(ptr);
     }
     fn finalize(&mut self) {
-        self.sorted.sort_unstable();
+        // `arena_walk_objects` emits one strictly-ascending pointer run
+        // per arena block (each user_ptr = block.data + offset, and
+        // offset only increases). Across blocks the order is arbitrary,
+        // and the trailing malloc-objects span is in insertion order.
+        // Rust's stable `sort()` (driftsort) detects long natural runs
+        // and merges them in O(N log K) where K is the number of runs;
+        // `sort_unstable()` (pdqsort) was tripping its quicksort/heapsort
+        // worst-case detector on this exact input shape, accounting for
+        // ~22 % of total runtime in ECS perf-comprehensive's GC.
+        self.sorted.sort();
     }
     pub(crate) fn contains(&self, ptr: &usize) -> bool {
         self.sorted.binary_search(ptr).is_ok()
