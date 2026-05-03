@@ -398,22 +398,40 @@ thread_local! {
 pub const SHADOW_STACK_HEADER_SLOTS: usize = 2; // prev_frame_top + slot_count
 pub const SHADOW_STACK_GROW_RESERVE: usize = 1024; // initial capacity (slots)
 
-thread_local! {
-    /// The shadow stack itself. `Vec<u64>` instead of `Vec<*mut u8>`
-    /// because slots hold NaN-boxed JSValue bits (upper 16 bits are
-    /// the tag, lower 48 the pointer) — the GC tracer unwraps the
-    /// NaN-box the same way it already does for closure captures.
-    pub(crate) static SHADOW_STACK: std::cell::RefCell<Vec<u64>> =
-        std::cell::RefCell::new(Vec::with_capacity(SHADOW_STACK_GROW_RESERVE));
-
-    /// Index into SHADOW_STACK where the current frame's slot_0 lives.
+/// Combined shadow-stack state. Holding both fields in one TLS slot
+/// halves the macOS `tlv_get_addr` calls in every shadow-stack op
+/// (push / pop / slot_set / slot_get / scanner) — those ops fired
+/// ~3 M+ times per perf-comprehensive run, and TLS access was the
+/// single biggest leaf cost in the post-iter-3 profile (20.9 % leaf
+/// samples on `tlv_get_addr`). Replacing `RefCell<Vec<u64>>` with
+/// `UnsafeCell<ShadowStackState>` also drops the per-op RefCell
+/// borrow accounting.
+///
+/// Safety: shadow-stack ops are only invoked from compiled JS code
+/// (runtime-generated, single-threaded for this TLS) and from GC
+/// scanner / rewriter passes. The two never overlap — GC is
+/// stop-the-world relative to this TLS, and compiled code can't
+/// re-enter the runtime through a path that would touch this state
+/// while a GC walk is in progress (no allocation occurs inside the
+/// scanner/rewriter, and `GC_FLAG_IN_ALLOC` blocks reentrant GC).
+pub(crate) struct ShadowStackState {
+    /// `Vec<u64>` instead of `Vec<*mut u8>` because slots hold
+    /// NaN-boxed JSValue bits (upper 16 bits are the tag, lower 48
+    /// the pointer) — the GC tracer unwraps the NaN-box the same way
+    /// it already does for closure captures.
+    pub(crate) stack: Vec<u64>,
+    /// Index into `stack` where the current frame's slot_0 lives.
     /// `usize::MAX` when no frame is pushed (initial state + after
-    /// the outermost function returns). Hot-path-critical: every
-    /// slot-store is `SHADOW_STACK[SHADOW_STACK_FRAME_TOP + slot_idx]`,
-    /// so the `Cell` access lets codegen compile this to one load +
-    /// one index, no borrow.
-    pub(crate) static SHADOW_STACK_FRAME_TOP: std::cell::Cell<usize> =
-        const { std::cell::Cell::new(usize::MAX) };
+    /// the outermost function returns).
+    pub(crate) frame_top: usize,
+}
+
+thread_local! {
+    pub(crate) static SHADOW: std::cell::UnsafeCell<ShadowStackState> =
+        std::cell::UnsafeCell::new(ShadowStackState {
+            stack: Vec::with_capacity(SHADOW_STACK_GROW_RESERVE),
+            frame_top: usize::MAX,
+        });
 }
 
 /// Push a new shadow-stack frame with `slot_count` live-pointer
@@ -427,36 +445,36 @@ thread_local! {
 /// function entry; the 3-line body inlines naturally.
 #[no_mangle]
 pub extern "C" fn js_shadow_frame_push(slot_count: u32) -> u64 {
-    let prev_top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
-    SHADOW_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        let base = stack.len();
+    SHADOW.with(|cell| unsafe {
+        let s = &mut *cell.get();
+        let prev_top = s.frame_top;
+        let base = s.stack.len();
         // Header: prev_frame_top + slot_count. Slots follow,
         // initialized to 0 (GC_FLAG_NONE + null pointer).
-        stack.push(prev_top as u64);
-        stack.push(slot_count as u64);
-        let slots_start = stack.len();
-        stack.resize(slots_start + slot_count as usize, 0);
-        SHADOW_STACK_FRAME_TOP.with(|c| c.set(slots_start));
+        s.stack.push(prev_top as u64);
+        s.stack.push(slot_count as u64);
+        let slots_start = s.stack.len();
+        s.stack.resize(slots_start + slot_count as usize, 0);
+        s.frame_top = slots_start;
         base as u64
     })
 }
 
 /// Pop the current shadow-stack frame. `frame_handle` must match
 /// the return value of the matching `js_shadow_frame_push` (debug
-/// assertion). Restores the prior `SHADOW_STACK_FRAME_TOP`.
+/// assertion). Restores the prior `SHADOW.frame_top`.
 #[no_mangle]
 pub extern "C" fn js_shadow_frame_pop(frame_handle: u64) {
-    SHADOW_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
+    SHADOW.with(|cell| unsafe {
+        let s = &mut *cell.get();
         let base = frame_handle as usize;
         debug_assert!(
-            base + SHADOW_STACK_HEADER_SLOTS <= stack.len(),
+            base + SHADOW_STACK_HEADER_SLOTS <= s.stack.len(),
             "shadow-stack pop past end (corrupted frame handle)"
         );
-        let prev_top = stack[base] as usize;
-        stack.truncate(base);
-        SHADOW_STACK_FRAME_TOP.with(|c| c.set(prev_top));
+        let prev_top = s.stack[base] as usize;
+        s.stack.truncate(base);
+        s.frame_top = prev_top;
     });
 }
 
@@ -467,15 +485,15 @@ pub extern "C" fn js_shadow_frame_pop(frame_handle: u64) {
 /// and debug builds.
 #[no_mangle]
 pub extern "C" fn js_shadow_slot_set(idx: u32, value: u64) {
-    let top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
-    if top == usize::MAX {
-        return;
-    } // no frame active — no-op
-    SHADOW_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
+    SHADOW.with(|cell| unsafe {
+        let s = &mut *cell.get();
+        let top = s.frame_top;
+        if top == usize::MAX {
+            return; // no frame active — no-op
+        }
         let slot = top + idx as usize;
-        if slot < stack.len() {
-            stack[slot] = value;
+        if slot < s.stack.len() {
+            s.stack[slot] = value;
         }
     });
 }
@@ -485,15 +503,15 @@ pub extern "C" fn js_shadow_slot_set(idx: u32, value: u64) {
 /// function call per slot.
 #[no_mangle]
 pub extern "C" fn js_shadow_slot_get(idx: u32) -> u64 {
-    let top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
-    if top == usize::MAX {
-        return 0;
-    }
-    SHADOW_STACK.with(|s| {
-        let stack = s.borrow();
+    SHADOW.with(|cell| unsafe {
+        let s = &*cell.get();
+        let top = s.frame_top;
+        if top == usize::MAX {
+            return 0;
+        }
         let slot = top + idx as usize;
-        if slot < stack.len() {
-            stack[slot]
+        if slot < s.stack.len() {
+            s.stack[slot]
         } else {
             0
         }
@@ -502,20 +520,20 @@ pub extern "C" fn js_shadow_slot_get(idx: u32) -> u64 {
 
 /// Current frame depth — test-only.
 pub fn shadow_stack_depth() -> usize {
-    SHADOW_STACK.with(|s| {
-        let stack = s.borrow();
+    SHADOW.with(|cell| unsafe {
+        let s = &*cell.get();
         // Count frames by walking prev_frame_top pointers from the
         // top back to the bottom. Depth = number of hops to reach
         // `usize::MAX`.
-        let mut top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
+        let mut top = s.frame_top;
         let mut depth = 0;
         while top != usize::MAX && top >= SHADOW_STACK_HEADER_SLOTS {
             depth += 1;
             let header_base = top - SHADOW_STACK_HEADER_SLOTS;
-            if header_base >= stack.len() {
+            if header_base >= s.stack.len() {
                 break;
             }
-            top = stack[header_base] as usize;
+            top = s.stack[header_base] as usize;
         }
         depth
     })
@@ -3197,32 +3215,32 @@ fn rewrite_heap_objects(valid_ptrs: &ValidPointerSet) {
 /// only reading. Slots hold NaN-boxed `JSValue` bits — same
 /// encoding `try_rewrite_value` understands.
 fn rewrite_shadow_stack_slots(valid_ptrs: &ValidPointerSet) {
-    SHADOW_STACK.with(|s| {
-        let mut stack = s.borrow_mut();
-        if stack.is_empty() {
+    SHADOW.with(|cell| unsafe {
+        let s = &mut *cell.get();
+        if s.stack.is_empty() {
             return;
         }
-        let mut top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
+        let mut top = s.frame_top;
         while top != usize::MAX && top >= SHADOW_STACK_HEADER_SLOTS {
             let header_base = top - SHADOW_STACK_HEADER_SLOTS;
-            if header_base + 1 >= stack.len() {
+            if header_base + 1 >= s.stack.len() {
                 break;
             }
-            let slot_count = stack[header_base + 1] as usize;
+            let slot_count = s.stack[header_base + 1] as usize;
             let slots_end = top + slot_count;
-            if slots_end > stack.len() {
+            if slots_end > s.stack.len() {
                 break;
             }
             for i in 0..slot_count {
-                let bits = stack[top + i];
+                let bits = s.stack[top + i];
                 if bits == 0 {
                     continue;
                 }
                 if let Some(new_bits) = try_rewrite_value(bits, valid_ptrs) {
-                    stack[top + i] = new_bits;
+                    s.stack[top + i] = new_bits;
                 }
             }
-            top = stack[header_base] as usize;
+            top = s.stack[header_base] as usize;
         }
     });
 }
@@ -3379,33 +3397,33 @@ pub fn remembered_set_clear() {
 /// active, or PERRY_SHADOW_STACK=0 at compile time so push/pop
 /// never emitted) also contributes nothing.
 pub fn shadow_stack_root_scanner(mark: &mut dyn FnMut(f64)) {
-    SHADOW_STACK.with(|s| {
-        let stack = s.borrow();
-        if stack.is_empty() {
+    SHADOW.with(|cell| unsafe {
+        let s = &*cell.get();
+        if s.stack.is_empty() {
             return;
         }
         // Walk every frame by chasing prev_frame_top pointers from
         // the current top. Each frame's layout:
         //   [slot_0 .. slot_{n-1}]  with header at prev
         //     = [prev_frame_top, slot_count] at (top - 2, top - 1)
-        let mut top = SHADOW_STACK_FRAME_TOP.with(|c| c.get());
+        let mut top = s.frame_top;
         while top != usize::MAX && top >= SHADOW_STACK_HEADER_SLOTS {
             let header_base = top - SHADOW_STACK_HEADER_SLOTS;
-            if header_base + 1 >= stack.len() {
+            if header_base + 1 >= s.stack.len() {
                 break;
             }
-            let slot_count = stack[header_base + 1] as usize;
+            let slot_count = s.stack[header_base + 1] as usize;
             let slots_end = top + slot_count;
-            if slots_end > stack.len() {
+            if slots_end > s.stack.len() {
                 break;
             }
             for i in 0..slot_count {
-                let bits = stack[top + i];
+                let bits = s.stack[top + i];
                 if bits != 0 {
                     mark(f64::from_bits(bits));
                 }
             }
-            top = stack[header_base] as usize;
+            top = s.stack[header_base] as usize;
         }
     });
 }
@@ -3665,8 +3683,11 @@ mod tests {
     /// between tests. Needed because Rust's thread-local state
     /// persists across tests in the same thread.
     fn reset_shadow_stack() {
-        SHADOW_STACK.with(|s| s.borrow_mut().clear());
-        SHADOW_STACK_FRAME_TOP.with(|c| c.set(usize::MAX));
+        SHADOW.with(|cell| unsafe {
+            let s = &mut *cell.get();
+            s.stack.clear();
+            s.frame_top = usize::MAX;
+        });
     }
 
     #[test]
