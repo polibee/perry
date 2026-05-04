@@ -470,8 +470,20 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
             // iterates to a fixed point on int-stable writes) and the
             // `module_globals` / `boxed_vars` exclusions already keep the
             // right locals off the shadow path.
+            // Drop the `*mutable` gate: immutable integer-stable Lets
+            // also benefit from an i32 shadow when they participate in
+            // an integer-arithmetic chain (`const row = yy * W;` then
+            // `idx = (row + xx) * 3` in a hot inner loop). The
+            // saturation concern in the original v0.5.164 comment was
+            // about `const SEED = 0x9E3779B9 >>> 0` whose value
+            // exceeds INT32_MAX — but that's a u32 (`>>> 0`), and
+            // `>>> 0` is intentionally not seeded into integer_locals
+            // (see collect_integer_let_ids), so SEED never ends up
+            // in this code path. Integer-stable immutable Lets that
+            // DO get seeded (Integer literal / clamp call /
+            // is_int32_producing_expr Add/Sub/Mul over int candidates)
+            // can't legitimately overflow i32 in any reachable workload.
             let needs_i32_slot = ctx.integer_locals.contains(id)
-                && *mutable
                 && init_in_i32_range
                 && !ctx.boxed_vars.contains(id)
                 && !ctx.module_globals.contains_key(id)
@@ -499,8 +511,50 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                     crate::nanbox::double_literal(f64::from_bits(crate::nanbox::TAG_UNDEFINED));
                 ctx.block().store(DOUBLE, &undef, &slot);
             } else if let Some(init_expr) = init {
-                let v = lower_expr(ctx, init_expr)?;
-                ctx.block().store(DOUBLE, &v, &slot);
+                // Issue #49 follow-up: i32-native init path. If this local
+                // has an i32 shadow slot AND the init expression can be
+                // lowered straight to i32 (Add/Sub/Mul/bitwise on i32
+                // operands, clamp call, MathImul, Integer literal,
+                // Buffer/Uint8ArrayGet, …), compute the init in i32
+                // directly and `sitofp` to seed the double slot. This
+                // avoids the `fadd → fmul → fptosi` round-trip that
+                // image_convolution's `let row = yy * W` would otherwise
+                // emit when both operands have i32 slots.
+                let used_i32_init = if let Some(i32_slot) =
+                    ctx.i32_counter_slots.get(id).cloned()
+                {
+                    let i32_slots = ctx.i32_counter_slots.clone();
+                    let flat_ca = ctx.flat_const_arrays.clone();
+                    let ara = ctx.array_row_aliases.clone();
+                    let int_locals = ctx.integer_locals.clone();
+                    if crate::expr::can_lower_expr_as_i32(
+                        init_expr,
+                        &i32_slots,
+                        &flat_ca,
+                        &ara,
+                        &int_locals,
+                        ctx.clamp3_functions,
+                        ctx.clamp_u8_functions,
+                    ) {
+                        let i32_v = crate::expr::lower_expr_as_i32(ctx, init_expr)?;
+                        let blk = ctx.block();
+                        blk.store(I32, &i32_v, &i32_slot);
+                        let v = blk.sitofp(I32, &i32_v, DOUBLE);
+                        blk.store(DOUBLE, &v, &slot);
+                        true
+                    } else {
+                        false
+                    }
+                } else {
+                    false
+                };
+                let v = if !used_i32_init {
+                    let v = lower_expr(ctx, init_expr)?;
+                    ctx.block().store(DOUBLE, &v, &slot);
+                    v
+                } else {
+                    String::new() // unused below; cleanup blocks check used_i32_init
+                };
                 // Gen-GC Phase A sub-phase 3b: if this local has a
                 // shadow-frame slot, mirror the store into the
                 // frame. Bitcast double → i64 (NaN-box bits) then
@@ -511,23 +565,25 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 // Let — measured noise on bench_json_roundtrip.
                 // Only fires when PERRY_SHADOW_STACK=1 is set at
                 // compile time, since the map is empty otherwise.
-                if let Some(&slot_idx) = ctx.shadow_slot_map.get(id) {
-                    let v_i64 = ctx.block().bitcast_double_to_i64(&v);
-                    ctx.block().call_void(
-                        "js_shadow_slot_set",
-                        &[(I32, &slot_idx.to_string()), (I64, &v_i64)],
-                    );
-                }
-                // Seed the i32 slot from the init value when the local has one.
-                // Use fptosi→i64 + trunc→i32 instead of direct fptosi→i32
-                // to handle unsigned values (e.g. `let s = 0x9E3779B9 >>> 0`
-                // where the double exceeds INT32_MAX). Direct fptosi→i32 is
-                // UB for such values; going through i64 then truncating gives
-                // the correct bit pattern.
-                if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
-                    let v_i64 = ctx.block().fptosi(DOUBLE, &v, crate::types::I64);
-                    let v_i32 = ctx.block().trunc(crate::types::I64, &v_i64, I32);
-                    ctx.block().store(I32, &v_i32, &i32_slot);
+                if !used_i32_init {
+                    if let Some(&slot_idx) = ctx.shadow_slot_map.get(id) {
+                        let v_i64 = ctx.block().bitcast_double_to_i64(&v);
+                        ctx.block().call_void(
+                            "js_shadow_slot_set",
+                            &[(I32, &slot_idx.to_string()), (I64, &v_i64)],
+                        );
+                    }
+                    // Seed the i32 slot from the init value when the local has one.
+                    // Use fptosi→i64 + trunc→i32 instead of direct fptosi→i32
+                    // to handle unsigned values (e.g. `let s = 0x9E3779B9 >>> 0`
+                    // where the double exceeds INT32_MAX). Direct fptosi→i32 is
+                    // UB for such values; going through i64 then truncating gives
+                    // the correct bit pattern.
+                    if let Some(i32_slot) = ctx.i32_counter_slots.get(id).cloned() {
+                        let v_i64 = ctx.block().fptosi(DOUBLE, &v, crate::types::I64);
+                        let v_i32 = ctx.block().trunc(crate::types::I64, &v_i64, I32);
+                        ctx.block().store(I32, &v_i32, &i32_slot);
+                    }
                 }
                 // Buffer data-pointer slot for local (non-global) const buffers.
                 // `const src = Buffer.alloc(N)` at module-level lives here when
@@ -535,7 +591,14 @@ pub(crate) fn lower_stmt(ctx: &mut FnCtx<'_>, stmt: &Stmt) -> Result<()> {
                 // image_conv blur kernel. The pre-computed ptr slot lets
                 // Uint8ArrayGet/Set emit `getelementptr inbounds` from a
                 // proper `ptr` base instead of an `inttoptr` chain.
-                if !*mutable && matches!(init_expr, perry_hir::Expr::BufferAlloc { .. }) {
+                //
+                // Only relevant on the f64-init path (BufferAlloc isn't
+                // i32-able, so used_i32_init is always false here, but
+                // gate explicitly to keep the invariant readable).
+                if !used_i32_init
+                    && !*mutable
+                    && matches!(init_expr, perry_hir::Expr::BufferAlloc { .. })
+                {
                     let blk = ctx.block();
                     let handle = crate::expr::unbox_to_i64(blk, &v);
                     let handle_ptr = blk.inttoptr(I64, &handle);
